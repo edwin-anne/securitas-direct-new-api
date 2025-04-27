@@ -19,7 +19,7 @@ from homeassistant.const import (
     CONF_USERNAME,
     Platform,
 )
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
@@ -64,9 +64,6 @@ DEFAULT_PERI_ALARM = False
 PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.SENSOR, Platform.BUTTON]
 HUB = None
 
-ATTR_INSTALLATION_ID = "instalation_id"
-SERVICE_REFRESH_INSTALLATION = "refresh_alarm_status"
-
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -86,14 +83,6 @@ CONFIG_SCHEMA = vol.Schema(
         )
     },
     extra=vol.ALLOW_EXTRA,
-)
-
-REFRESH_ALARM_STATUS_SCHEMA = vol.Schema(
-    {
-        vol.Required(
-            ATTR_INSTALLATION_ID, description="Installation number"
-        ): cv.positive_int
-    }
 )
 
 
@@ -209,9 +198,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             hass.data.setdefault(DOMAIN, {})[entry.unique_id] = config
             hass.data.setdefault(DOMAIN, {})[CONF_INSTALLATION_KEY] = devices
-            await hass.async_add_executor_job(setup_hass_services, hass)
             await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-            # hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, lambda event: client.logout())
             return True
     else:
         config = add_device_information(entry.data.copy())
@@ -235,67 +222,6 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     if not hass.data[DOMAIN]:
         hass.data.pop(DOMAIN)
     return unload_ok
-
-
-def setup_hass_services(hass: HomeAssistant) -> None:
-    """Home Assistant services."""
-
-    async def async_change_setting(call: ServiceCall) -> None:
-        """Mise à jour du statut de l'alarme Securitas."""
-        installation_id = call.data[ATTR_INSTALLATION_ID]
-
-        client: SecuritasHub = hass.data[DOMAIN][SecuritasHub.__name__]
-        found_installation = None
-        
-        for installation in await client.session.list_installations():
-            if installation.number == str(installation_id):
-                found_installation = installation
-                break
-                
-        if found_installation:
-            try:
-                # Obtenir un nouveau référence_id pour forcer une mise à jour complète
-                reference_id = await client.session.check_alarm(found_installation)
-                # Court délai pour laisser le temps à l'API de traiter la demande
-                await asyncio.sleep(1)
-                # Récupérer le statut de l'alarme avec le nouveau référence_id
-                alarm_status = await client.session.check_alarm_status(found_installation, reference_id)
-                
-                # Mettre à jour le statut manuellement dans l'API
-                client.session.protom_response = alarm_status.protomResponse
-                
-                # Déclencher un événement pour informer Home Assistant
-                hass.bus.async_fire(f"{DOMAIN}_alarm_updated", {
-                    "installation_id": installation_id,
-                    "status": alarm_status.protomResponse
-                })
-                
-                # Redémarrer les entités d'alarme
-                alarm_entity_id = f"alarm_control_panel.securitas_direct_{installation_id}"
-                if alarm_entity_id in hass.states.async_entity_ids("alarm_control_panel"):
-                    # Demander une mise à jour de l'état
-                    await hass.services.async_call(
-                        "homeassistant", 
-                        "update_entity", 
-                        {"entity_id": alarm_entity_id},
-                        blocking=True
-                    )
-                
-                _LOGGER.info("Statut de l'alarme mis à jour avec succès pour l'installation %s: %s", 
-                           installation_id, alarm_status.protomResponse)
-                
-            except Exception as ex:
-                _LOGGER.error("Erreur lors de la mise à jour du statut de l'alarme: %s", str(ex))
-        else:
-            _LOGGER.error("Aucune installation trouvée avec l'ID %s", installation_id)
-
-    hass.services.register(
-        DOMAIN,
-        SERVICE_REFRESH_INSTALLATION,
-        async_change_setting,
-        schema=REFRESH_ALARM_STATUS_SCHEMA,
-    )
-
 
 def _notify_error(
     hass: HomeAssistant, notification_id, title: str, message: str
