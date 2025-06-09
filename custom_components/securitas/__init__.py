@@ -67,7 +67,7 @@ DEFAULT_DISABLE_SENSOR_UPDATES = False
 DEFAULT_DISABLE_TOKEN_REFRESH = False
 
 
-PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.SENSOR, Platform.BUTTON]
+PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.BUTTON, Platform.SENSOR]
 HUB = None
 
 
@@ -249,7 +249,6 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     if not hass.data[DOMAIN]:
         hass.data.pop(DOMAIN)
     return unload_ok
-
 
 def _notify_error(
     hass: HomeAssistant, notification_id, title: str, message: str
