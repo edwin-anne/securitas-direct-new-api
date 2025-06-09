@@ -52,6 +52,9 @@ CONF_DEVICE_INDIGITALL = "idDeviceIndigitall"
 CONF_ENTRY_ID = "entry_id"
 CONF_INSTALLATION_KEY = "instalation"
 CONF_DELAY_CHECK_OPERATION = "delay_check_operation"
+CONF_DISABLE_ALARM_UPDATES = "disable_alarm_updates"
+CONF_DISABLE_SENSOR_UPDATES = "disable_sensor_updates"
+CONF_DISABLE_TOKEN_REFRESH = "disable_token_refresh"
 
 DEFAULT_USE_2FA = True
 DEFAULT_SCAN_INTERVAL = 120
@@ -59,6 +62,9 @@ DEFAULT_CHECK_ALARM_PANEL = True
 DEFAULT_DELAY_CHECK_OPERATION = 2
 DEFAULT_CODE = ""
 DEFAULT_PERI_ALARM = False
+DEFAULT_DISABLE_ALARM_UPDATES = False
+DEFAULT_DISABLE_SENSOR_UPDATES = False
+DEFAULT_DISABLE_TOKEN_REFRESH = False
 
 
 PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.SENSOR, Platform.BUTTON]
@@ -79,6 +85,15 @@ CONFIG_SCHEMA = vol.Schema(
                     CONF_CHECK_ALARM_PANEL, default=DEFAULT_CHECK_ALARM_PANEL
                 ): bool,
                 vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
+                vol.Optional(
+                    CONF_DISABLE_ALARM_UPDATES, default=DEFAULT_DISABLE_ALARM_UPDATES
+                ): bool,
+                vol.Optional(
+                    CONF_DISABLE_SENSOR_UPDATES, default=DEFAULT_DISABLE_SENSOR_UPDATES
+                ): bool,
+                vol.Optional(
+                    CONF_DISABLE_TOKEN_REFRESH, default=DEFAULT_DISABLE_TOKEN_REFRESH
+                ): bool,
             }
         )
     },
@@ -108,6 +123,9 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
             CONF_CODE,
             CONF_SCAN_INTERVAL,
             CONF_CHECK_ALARM_PANEL,
+            CONF_DISABLE_ALARM_UPDATES,
+            CONF_DISABLE_SENSOR_UPDATES,
+            CONF_DISABLE_TOKEN_REFRESH,
         )
     ):
         # update entry replacing data with new options
@@ -136,6 +154,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     config[CONF_DELAY_CHECK_OPERATION] = entry.data.get(
         CONF_DELAY_CHECK_OPERATION, DEFAULT_DELAY_CHECK_OPERATION
+    )
+    config[CONF_DISABLE_ALARM_UPDATES] = entry.data.get(
+        CONF_DISABLE_ALARM_UPDATES, DEFAULT_DISABLE_ALARM_UPDATES
+    )
+    config[CONF_DISABLE_SENSOR_UPDATES] = entry.data.get(
+        CONF_DISABLE_SENSOR_UPDATES, DEFAULT_DISABLE_SENSOR_UPDATES
+    )
+    config[CONF_DISABLE_TOKEN_REFRESH] = entry.data.get(
+        CONF_DISABLE_TOKEN_REFRESH, DEFAULT_DISABLE_TOKEN_REFRESH
     )
     config[CONF_ENTRY_ID] = entry.entry_id
     config = add_device_information(config)
@@ -303,6 +330,15 @@ class SecuritasHub:
         self.config_entry: ConfigEntry = config_entry
         self.sentinel_services: list[Service] = []
         self.check_alarm: bool = domain_config[CONF_CHECK_ALARM_PANEL]
+        self.disable_alarm_updates: bool = domain_config.get(
+            CONF_DISABLE_ALARM_UPDATES, DEFAULT_DISABLE_ALARM_UPDATES
+        )
+        self.disable_sensor_updates: bool = domain_config.get(
+            CONF_DISABLE_SENSOR_UPDATES, DEFAULT_DISABLE_SENSOR_UPDATES
+        )
+        self.disable_token_refresh: bool = domain_config.get(
+            CONF_DISABLE_TOKEN_REFRESH, DEFAULT_DISABLE_TOKEN_REFRESH
+        )
         self.country: str = domain_config[CONF_COUNTRY].upper()
         self.lang: str = ApiDomains().get_language(self.country)
         self.hass: HomeAssistant = hass
@@ -322,6 +358,7 @@ class SecuritasHub:
             domain_config[CONF_DEVICE_INDIGITALL],
             self.command_type,
             domain_config[CONF_DELAY_CHECK_OPERATION],
+            self.disable_token_refresh,
         )
         self.installations: list[Installation] = []
 

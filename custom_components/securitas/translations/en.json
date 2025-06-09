@@ -14,7 +14,10 @@
                     "PERI_alarm": "Is there a Perimetral alarm?",
                     "check_alarm_panel": "Check alarm panel's status in every request",
                     "scan_interval": "Update scan interval (sec)",
-                    "delay_check_operation":"Delay to check the arming and disarming operations (sec)"
+                    "delay_check_operation":"Delay to check the arming and disarming operations (sec)",
+                    "disable_alarm_updates": "Disable automatic alarm status updates",
+                    "disable_sensor_updates": "Disable automatic sensor updates",
+                    "disable_token_refresh": "Disable automatic token refresh"
                 },
                 "description": "Login into Securitas Direct.",
                 "title": "Login"
@@ -37,7 +40,10 @@
                     "PERI_alarm": "Is there a Perimetral alarm?",
                     "check_alarm_panel": "Check alarm panel's status in every request (not recommended)",
                     "scan_interval": "Update scan interval (sec)",
-                    "delay_check_operation": "Delay to check the arming and disarming operation (sec)"
+                    "delay_check_operation": "Delay to check the arming and disarming operation (sec)",
+                    "disable_alarm_updates": "Disable automatic alarm status updates",
+                    "disable_sensor_updates": "Disable automatic sensor updates",
+                    "disable_token_refresh": "Disable automatic token refresh"
                 }
             }
         }

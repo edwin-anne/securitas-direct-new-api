@@ -112,9 +112,12 @@ class SecuritasAlarm(alarm.AlarmControlPanelEntity):
         self._update_interval: timedelta = timedelta(
             seconds=client.config.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         )
-        self._update_unsub = async_track_time_interval(
-            hass, self.async_update_status, self._update_interval
-        )
+        # Only setup automatic updates if not disabled
+        self._update_unsub = None
+        if not client.disable_alarm_updates:
+            self._update_unsub = async_track_time_interval(
+                hass, self.async_update_status, self._update_interval
+            )
 
         self._attr_device_info: DeviceInfo = DeviceInfo(
             identifiers={(DOMAIN, self._attr_unique_id)},
@@ -180,10 +183,17 @@ class SecuritasAlarm(alarm.AlarmControlPanelEntity):
 
     async def async_update(self) -> None:
         """Update the status of the alarm based on the configuration. This is called when HA reloads."""
-        await self.async_update_status()
+        # Only update if automatic updates are not disabled
+        if not self.client.disable_alarm_updates:
+            await self.async_update_status()
 
     async def async_update_status(self, now=None) -> None:
         """Update the status of the alarm."""
+        # Skip update if disabled
+        if self.client.disable_alarm_updates:
+            _LOGGER.debug("Alarm updates are disabled, skipping update")
+            return
+            
         alarm_status: CheckAlarmStatus = CheckAlarmStatus()
         try:
             alarm_status = await self.client.update_overview(self.installation)

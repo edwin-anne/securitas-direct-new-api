@@ -1,0 +1,51 @@
+{
+    "config": {
+        "abort": {
+            "already_configured": "Le service est déjà configuré"
+        },
+        "step": {
+            "user": {
+                "data": {
+                    "username": "Nom d'utilisateur",
+                    "password": "Mot de passe",
+                    "use_2FA": "Utiliser 2FA",
+                    "country": "Code pays",
+                    "code": "Code PIN (laisser vide pour aucun PIN)",
+                    "PERI_alarm": "Y a-t-il une alarme périmétrale ?",
+                    "check_alarm_panel": "Vérifier l'état du panneau d'alarme à chaque requête",
+                    "scan_interval": "Intervalle de mise à jour (sec)",
+                    "delay_check_operation": "Délai pour vérifier les opérations d'armement et de désarmement (sec)",
+                    "disable_alarm_updates": "Désactiver les mises à jour automatiques de l'état de l'alarme",
+                    "disable_sensor_updates": "Désactiver les mises à jour automatiques des capteurs",
+                    "disable_token_refresh": "Désactiver le rafraîchissement automatique du token"
+                },
+                "description": "Se connecter à Securitas Direct.",
+                "title": "Connexion"
+            },
+            "phone_list": {
+                "description": "Veuillez sélectionner le téléphone pour envoyer le code 2FA",
+                "title": "Securitas Direct 2FA"
+            },
+            "otp_challenge": {
+                "description": "Entrez le code que vous avez reçu sur votre téléphone",
+                "title": "Securitas Direct 2FA"
+            }
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "data": {
+                    "code": "Code PIN (laisser vide pour aucun PIN)",
+                    "PERI_alarm": "Y a-t-il une alarme périmétrale ?",
+                    "check_alarm_panel": "Vérifier l'état du panneau d'alarme à chaque requête (non recommandé)",
+                    "scan_interval": "Intervalle de mise à jour (sec)",
+                    "delay_check_operation": "Délai pour vérifier l'opération d'armement et de désarmement (sec)",
+                    "disable_alarm_updates": "Désactiver les mises à jour automatiques de l'état de l'alarme",
+                    "disable_sensor_updates": "Désactiver les mises à jour automatiques des capteurs",
+                    "disable_token_refresh": "Désactiver le rafraîchissement automatique du token"
+                }
+            }
+        }
+    }
+}

@@ -55,6 +55,7 @@ class ApiManager:
         id_device_indigitall: str,
         command_type: CommandType,
         delay_check_operation: int = 2,
+        disable_token_refresh: bool = False,
     ) -> None:
         """Create the object."""
         self.username = username
@@ -65,6 +66,7 @@ class ApiManager:
         self.api_url = domains.get_url(country)
         self.command_map = COMMAND_MAP[command_type]
         self.delay_check_operation: int = delay_check_operation
+        self.disable_token_refresh: bool = disable_token_refresh
 
         self.protom_response: str = ""
         self.authentication_token: str = ""
@@ -224,6 +226,10 @@ class ApiManager:
 
     async def _check_authentication_token(self) -> None:
         """Check expiration of the authentication token and get a new one if needed."""
+        
+        if self.disable_token_refresh:
+            _LOGGER.debug("Token refresh is disabled, skipping token check")
+            return
 
         _LOGGER.debug(
             "Authentication token expires %s and now is %s",

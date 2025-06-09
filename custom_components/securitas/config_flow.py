@@ -29,12 +29,18 @@ from . import (
     CONF_COUNTRY,
     CONF_DELAY_CHECK_OPERATION,
     CONF_DEVICE_INDIGITALL,
+    CONF_DISABLE_ALARM_UPDATES,
+    CONF_DISABLE_SENSOR_UPDATES,
+    CONF_DISABLE_TOKEN_REFRESH,
     CONF_ENTRY_ID,
     CONF_PERI_ALARM,
     CONF_USE_2FA,
     CONFIG_SCHEMA,
     DEFAULT_CHECK_ALARM_PANEL,
     DEFAULT_DELAY_CHECK_OPERATION,
+    DEFAULT_DISABLE_ALARM_UPDATES,
+    DEFAULT_DISABLE_SENSOR_UPDATES,
+    DEFAULT_DISABLE_TOKEN_REFRESH,
     DEFAULT_PERI_ALARM,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -252,6 +258,21 @@ class SecuritasOptionsFlowHandler(config_entries.OptionsFlow):
             self.config_entry.data.get(CONF_PERI_ALARM, DEFAULT_PERI_ALARM),
         )
 
+        disable_alarm_updates: bool = self.config_entry.options.get(
+            CONF_DISABLE_ALARM_UPDATES,
+            self.config_entry.data.get(CONF_DISABLE_ALARM_UPDATES, DEFAULT_DISABLE_ALARM_UPDATES),
+        )
+
+        disable_sensor_updates: bool = self.config_entry.options.get(
+            CONF_DISABLE_SENSOR_UPDATES,
+            self.config_entry.data.get(CONF_DISABLE_SENSOR_UPDATES, DEFAULT_DISABLE_SENSOR_UPDATES),
+        )
+
+        disable_token_refresh: bool = self.config_entry.options.get(
+            CONF_DISABLE_TOKEN_REFRESH,
+            self.config_entry.data.get(CONF_DISABLE_TOKEN_REFRESH, DEFAULT_DISABLE_TOKEN_REFRESH),
+        )
+
         schema = vol.Schema(
             {
                 vol.Optional(CONF_CODE, default=code): str,
@@ -261,6 +282,9 @@ class SecuritasOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_DELAY_CHECK_OPERATION, default=delay_check_operation
                 ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=15.0)),
+                vol.Optional(CONF_DISABLE_ALARM_UPDATES, default=disable_alarm_updates): bool,
+                vol.Optional(CONF_DISABLE_SENSOR_UPDATES, default=disable_sensor_updates): bool,
+                vol.Optional(CONF_DISABLE_TOKEN_REFRESH, default=disable_token_refresh): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

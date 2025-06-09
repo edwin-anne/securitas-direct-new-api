@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from datetime import timedelta
+import logging
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
@@ -15,6 +16,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from . import CONF_INSTALLATION_KEY, DOMAIN, SecuritasDirectDevice, SecuritasHub
 from .constants import SentinelName
 from .securitas_direct_new_api.dataTypes import AirQuality, Sentinel, Service
+
+_LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(minutes=30)
 
@@ -85,6 +88,11 @@ class SentinelTemperature(SensorEntity):
 
     async def async_update(self):
         """Update the status of the alarm based on the configuration."""
+        # Skip update if sensor updates are disabled
+        if self._client.disable_sensor_updates:
+            _LOGGER.debug("Sensor updates are disabled, skipping temperature sensor update")
+            return
+            
         sentinel_data: Sentinel = await self._client.session.get_sentinel_data(
             self._service.installation, self._service
         )
@@ -123,6 +131,11 @@ class SentinelHumidity(SensorEntity):
 
     async def async_update(self):
         """Update the status of the alarm based on the configuration."""
+        # Skip update if sensor updates are disabled
+        if self._client.disable_sensor_updates:
+            _LOGGER.debug("Sensor updates are disabled, skipping humidity sensor update")
+            return
+            
         sentinel_data: Sentinel = await self._client.session.get_sentinel_data(
             self._service.installation, self._service
         )
@@ -162,6 +175,11 @@ class SentinelAirQuality(SensorEntity):
 
     async def async_update(self):
         """Update the status of the alarm based on the configuration."""
+        # Skip update if sensor updates are disabled
+        if self._client.disable_sensor_updates:
+            _LOGGER.debug("Sensor updates are disabled, skipping air quality sensor update")
+            return
+            
         air_quality: AirQuality = await self._client.session.get_air_quality_data(
             self._service.installation, self._service
         )
