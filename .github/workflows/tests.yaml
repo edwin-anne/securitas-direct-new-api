@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Ruff lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+  pylint:
+    name: Pylint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements_test.txt pylint
+
+      - name: Pylint
+        run: pylint custom_components/securitas/
+
+  typecheck:
+    name: Pyright
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements_test.txt pyright
+
+      - name: Pyright
+        run: pyright custom_components/
+
+  test:
+    name: Tests (${{ matrix.ha-channel }}, ${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # dev + stable run on the current Python (3.14, required by HA 2026.3+).
+        # The minimum channel pins HA 2025.2.0, whose phcc only supports 3.13,
+        # so it stays on 3.13 to keep proving our declared floor still works.
+        include:
+          - { ha-channel: dev, suite: unit, python-version: "3.14" }
+          - { ha-channel: dev, suite: integration, python-version: "3.14" }
+          - { ha-channel: stable, suite: unit, python-version: "3.14" }
+          - { ha-channel: stable, suite: integration, python-version: "3.14" }
+          - { ha-channel: minimum, suite: unit, python-version: "3.13" }
+          - { ha-channel: minimum, suite: integration, python-version: "3.13" }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libturbojpeg0-dev
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies (stable)
+        if: matrix.ha-channel == 'stable'
+        run: |
+          pip install --upgrade pip
+          # phcc pins the latest stable HA it supports — on Python 3.14 that is
+          # the 2026.6.x line. Just install normally.
+          pip install -r requirements_test.txt
+
+      - name: Install dependencies (minimum)
+        if: matrix.ha-channel == 'minimum'
+        run: |
+          pip install --upgrade pip
+          # phcc 0.13.210 pins homeassistant==2025.2.0 (our declared minimum)
+          # Install phcc first — it pins exact versions of pytest, pytest-asyncio,
+          # coverage etc. that conflict with the ~= ranges in requirements_test.txt
+          pip install pytest-homeassistant-custom-component==0.13.210 pytest-cov PyJWT~=2.10 PyTurboJPEG~=1.7
+
+      - name: Install dependencies (dev)
+        if: matrix.ha-channel == 'dev'
+        run: |
+          pip install --upgrade pip
+          python -m pip install --pre pytest-homeassistant-custom-component
+          pip install -r requirements_test.txt
+
+      - name: Run ${{ matrix.suite }} tests with coverage
+        env:
+          # parallel=true in pyproject.toml suffixes the data file per process;
+          # COVERAGE_FILE pins the base so artifacts upload cleanly.
+          COVERAGE_FILE: .coverage.${{ matrix.ha-channel }}.${{ matrix.suite }}
+        run: |
+          if [ "${{ matrix.suite }}" = "unit" ]; then
+            MARKER="not integration"
+          else
+            MARKER="integration"
+          fi
+          python -m pytest tests/ -v --tb=short \
+            -m "$MARKER" \
+            --cov --cov-report=term-missing --no-cov-on-fail
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.ha-channel }}-${{ matrix.suite }}
+          path: .coverage.${{ matrix.ha-channel }}.${{ matrix.suite }}*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  coverage-gate:
+    name: Coverage gate (90%)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - run: pip install coverage
+
+      # Gate on the stable channel only — code is identical across channels,
+      # so running the gate 3x would just multiply CI minutes for no signal.
+      - name: Download unit coverage (stable)
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-stable-unit
+
+      - name: Download integration coverage (stable)
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-stable-integration
+
+      - name: Combine and report
+        run: |
+          coverage combine
+          coverage report --fail-under=90

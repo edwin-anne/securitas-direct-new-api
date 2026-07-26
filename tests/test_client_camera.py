@@ -1,0 +1,916 @@
+"""Tests for VerisureOwaClient camera methods."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import jwt
+import pytest
+
+from custom_components.securitas.verisure_owa_api.client import (
+    VerisureOwaClient,
+)
+from custom_components.securitas.verisure_owa_api.http_transport import (
+    HttpTransport,
+)
+from custom_components.securitas.verisure_owa_api.models import (
+    CameraDevice,
+    Installation,
+    ThumbnailResponse,
+)
+
+# ── JWT helpers ──────────────────────────────────────────────────────────────
+
+SECRET = "test-secret"
+
+
+def make_jwt(exp_minutes: int = 15, **extra_claims) -> str:
+    """Create a real HS256 JWT with a known expiry."""
+    exp = datetime.now(tz=UTC) + timedelta(minutes=exp_minutes)
+    payload = {"exp": exp, "sub": "test-user", **extra_claims}
+    return jwt.encode(payload, SECRET, algorithm="HS256")
+
+
+FAKE_JWT = make_jwt(exp_minutes=15)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _make_installation(**overrides) -> Installation:
+    """Factory for Installation with sensible defaults."""
+    defaults = {
+        "number": "123456",
+        "alias": "Home",
+        "panel": "SDVFAST",
+        "type": "PLUS",
+        "name": "John",
+        "last_name": "Doe",
+        "address": "123 St",
+        "city": "Madrid",
+        "postal_code": "28001",
+        "province": "Madrid",
+        "email": "test@example.com",
+        "phone": "555-1234",
+    }
+    defaults.update(overrides)
+    return Installation(**defaults)
+
+
+def _pre_auth(client: VerisureOwaClient) -> None:
+    """Set up a valid auth token so _ensure_auth is a no-op."""
+    client.authentication_token = FAKE_JWT
+    client._authentication_token_exp = datetime.now() + timedelta(hours=1)
+    client.get_services = AsyncMock(return_value=[])
+
+
+# ── Response builders ────────────────────────────────────────────────────────
+
+
+def device_list_response(devices: list[dict] | None = None) -> dict:
+    """Build a mock xSDeviceList response."""
+    return {
+        "data": {
+            "xSDeviceList": {
+                "res": "OK",
+                "devices": devices,
+            }
+        }
+    }
+
+
+def request_images_response(reference_id: str = "ref-img-001") -> dict:
+    """Build a mock xSRequestImages response."""
+    return {
+        "data": {
+            "xSRequestImages": {
+                "res": "OK",
+                "msg": "",
+                "referenceId": reference_id,
+            }
+        }
+    }
+
+
+def request_images_status_response(
+    *, res: str = "OK", msg: str = "", status: str = "COMPLETED"
+) -> dict:
+    """Build a mock xSRequestImagesStatus response."""
+    return {
+        "data": {
+            "xSRequestImagesStatus": {
+                "res": res,
+                "msg": msg,
+                "numinst": "123456",
+                "status": status,
+            }
+        }
+    }
+
+
+def thumbnail_response(
+    *,
+    id_signal: str | None = "sig-001",
+    device_code: str = "01",
+    device_alias: str = "Camera 1",
+    timestamp: str = "2024-01-01T12:00:00",
+    signal_type: str = "IMG",
+    image: str | None = "base64imagedata",
+) -> dict:
+    """Build a mock xSGetThumbnail response."""
+    return {
+        "data": {
+            "xSGetThumbnail": {
+                "idSignal": id_signal,
+                "deviceCode": device_code,
+                "deviceAlias": device_alias,
+                "timestamp": timestamp,
+                "signalType": signal_type,
+                "image": image,
+                "type": "THUMBNAIL",
+                "quality": "HIGH",
+            }
+        }
+    }
+
+
+def photo_images_response(
+    devices: list[dict] | None = None,
+) -> dict:
+    """Build a mock xSGetPhotoImages response."""
+    return {
+        "data": {
+            "xSGetPhotoImages": {
+                "devices": devices,
+            }
+        }
+    }
+
+
+# ── Fixtures ─────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def transport():
+    """Create a mock HttpTransport."""
+    mock = MagicMock(spec=HttpTransport)
+    mock.execute = AsyncMock()
+    return mock
+
+
+@pytest.fixture
+def client(transport):
+    """Create a VerisureOwaClient with test credentials, mocked transport, fast polling."""
+    c = VerisureOwaClient(
+        transport=transport,
+        country="ES",
+        language="es",
+        username="test@example.com",
+        password="test-password",
+        device_id="test-device-id",
+        uuid="test-uuid",
+        id_device_indigitall="test-indigitall",
+        poll_delay=0.0,
+        poll_timeout=2.0,
+    )
+    _pre_auth(c)
+    return c
+
+
+# ── get_camera_devices tests ─────────────────────────────────────────────────
+
+
+class TestGetCameraDevices:
+    async def test_returns_filtered_camera_list(self, client, transport):
+        """Only QR, YR, YP, QP active devices are returned."""
+        transport.execute.return_value = device_list_response(
+            devices=[
+                {
+                    "id": "1",
+                    "code": "1",
+                    "zoneId": "QR01",
+                    "name": "Front Camera",
+                    "type": "QR",
+                    "isActive": True,
+                    "serialNumber": "SN001",
+                },
+                {
+                    "id": "2",
+                    "code": "2",
+                    "zoneId": "YR02",
+                    "name": "Back Camera",
+                    "type": "YR",
+                    "isActive": True,
+                    "serialNumber": "SN002",
+                },
+                {
+                    "id": "3",
+                    "code": "3",
+                    "zoneId": "DR01",
+                    "name": "Front Door Lock",
+                    "type": "DR",
+                    "isActive": True,
+                    "serialNumber": "SN003",
+                },
+                {
+                    "id": "4",
+                    "code": "4",
+                    "zoneId": "QR04",
+                    "name": "Inactive Camera",
+                    "type": "QR",
+                    "isActive": False,
+                    "serialNumber": "SN004",
+                },
+            ]
+        )
+
+        inst = _make_installation()
+        result = await client.get_camera_devices(inst)
+
+        assert len(result) == 2
+        assert all(isinstance(d, CameraDevice) for d in result)
+        assert result[0].name == "Front Camera"
+        assert result[0].device_type == "QR"
+        assert result[1].name == "Back Camera"
+        assert result[1].device_type == "YR"
+
+    async def test_empty_devices_list(self, client, transport):
+        """Returns empty list when no devices match."""
+        transport.execute.return_value = device_list_response(devices=[])
+
+        inst = _make_installation()
+        result = await client.get_camera_devices(inst)
+
+        assert result == []
+
+    async def test_none_devices(self, client, transport):
+        """Returns empty list when devices is None."""
+        transport.execute.return_value = device_list_response(devices=None)
+
+        inst = _make_installation()
+        result = await client.get_camera_devices(inst)
+
+        assert result == []
+
+    async def test_dedups_annex_double_listing(self, client, transport):
+        """Annex installations can return the same physical camera twice in
+        xSDeviceList (once per panel-view). Both entries share name, type
+        and code; only the row index ``id`` differs. ``zoneId`` is null for
+        every device in such installations, so the synthesised
+        f"{type}{code:02d}" zone_id collides for the duplicate rows
+        (https://github.com/guerrerotook/securitas-direct-new-api/issues/441).
+        get_camera_devices must collapse those rows by (type, code) so
+        each physical camera is registered exactly once.
+        """
+        # Captured from issue #441 reporter's annex install. Three physical
+        # cameras (codes 2, 3, 8); the annex one (code 8) appears at id=2
+        # and id=7. Two non-camera devices included so we also check the
+        # filter still drops them.
+        transport.execute.return_value = device_list_response(
+            devices=[
+                {
+                    "id": "0",
+                    "code": "2",
+                    "zoneId": None,
+                    "name": "Entrance",
+                    "type": "YR",
+                    "isActive": None,
+                    "serialNumber": None,
+                },
+                {
+                    "id": "1",
+                    "code": "3",
+                    "zoneId": None,
+                    "name": "Landing",
+                    "type": "YR",
+                    "isActive": None,
+                    "serialNumber": None,
+                },
+                {
+                    "id": "2",
+                    "code": "8",
+                    "zoneId": None,
+                    "name": "ANNEX Anex PD",
+                    "type": "YR",
+                    "isActive": None,
+                    "serialNumber": None,
+                },
+                {
+                    "id": "3",
+                    "code": "1",
+                    "zoneId": None,
+                    "name": "Control Panel",
+                    "type": "CENT",
+                    "isActive": None,
+                    "serialNumber": None,
+                },
+                {
+                    "id": "7",
+                    "code": "8",
+                    "zoneId": None,
+                    "name": "ANNEX Anex PD",
+                    "type": "YR",
+                    "isActive": None,
+                    "serialNumber": None,
+                },
+            ]
+        )
+
+        inst = _make_installation()
+        result = await client.get_camera_devices(inst)
+
+        # Three physical cameras returned, not four — annex camera deduplicated.
+        assert len(result) == 3
+        codes = sorted(c.code for c in result)
+        assert codes == [2, 3, 8]
+        # zone_ids must be distinct — otherwise HA would drop entities on register.
+        zone_ids = [c.zone_id for c in result]
+        assert len(zone_ids) == len(set(zone_ids))
+
+
+# ── capture_image tests ──────────────────────────────────────────────────────
+
+
+class TestCaptureImage:
+    async def test_full_flow(self, client, transport):
+        """submit -> status polls -> status done -> fetch thumbnail."""
+        transport.execute.side_effect = [
+            # 1. Submit capture request
+            request_images_response("ref-img-001"),
+            # 2. Status poll: still processing
+            request_images_status_response(res="WAIT", msg="processing image"),
+            # 3. Status poll: done
+            request_images_status_response(res="OK", msg="completed"),
+            # 4. Fetch thumbnail after status done
+            thumbnail_response(id_signal="new-sig", image="new-image-data"),
+        ]
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst, 1, "QR", "QR01", status_poll_delay=0.0
+        )
+
+        assert isinstance(result, ThumbnailResponse)
+        assert result.id_signal == "new-sig"
+        assert result.image == "new-image-data"
+
+    async def test_transient_error_during_status_poll_is_retried(
+        self, client, transport
+    ):
+        """ClientConnectorError on a status poll is retried, not propagated."""
+        from aiohttp import ClientConnectorError
+        from aiohttp.client_reqrep import ConnectionKey
+
+        conn_key = ConnectionKey("example.com", 443, False, True, None, None, None)
+        poll_count = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal poll_count
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                poll_count += 1
+                if poll_count == 1:
+                    raise ClientConnectorError(conn_key, OSError("transient"))
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                return thumbnail_response(id_signal="new-sig", image="data")
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst, 1, "QR", "QR01", status_poll_delay=0.0
+        )
+
+        assert result.id_signal == "new-sig"
+        assert poll_count == 2  # First raised transient, second succeeded
+
+    async def test_timeout_fetches_final_thumbnail(self, client, transport):
+        """When status polling times out, fetches one final thumbnail."""
+        call_count = 0
+
+        async def _side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return request_images_response("ref-img-001")
+            content = args[0] if args else {}
+            if (
+                isinstance(content, dict)
+                and content.get("operationName") == "mkGetThumbnail"
+            ):
+                # Final thumbnail fetch after timeout — CDN has caught up
+                return thumbnail_response(id_signal="new-sig")
+            # Status polls: always processing (will cause timeout)
+            return request_images_status_response(res="OK", msg="processing image")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst, 1, "QR", "QR01", capture_timeout=0.1, status_poll_delay=0.0
+        )
+
+        assert isinstance(result, ThumbnailResponse)
+        assert result.id_signal == "new-sig"
+
+    async def test_wait_for_fresh_uses_pre_fetch_as_baseline(self, client, transport):
+        """When wait_for_fresh=True, pre-fetch a thumbnail to learn the
+        CDN's current frame, then poll until something strictly newer
+        appears.  Comparing against a stale cached timestamp is wrong:
+        the CDN may already be serving a newer-but-still-stale frame
+        which would satisfy a cache-based check but isn't the freshly
+        captured image either.
+        """
+        pre_fetch_ts = "2026-05-16 19:19:08"  # what CDN serves right now
+        fresh_ts = "2026-05-16 19:20:12"  # what our request produces
+        thumbnail_calls = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal thumbnail_calls
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                thumbnail_calls += 1
+                # Calls: 1=pre-fetch (baseline), 2=stale, 3=fresh
+                if thumbnail_calls <= 2:
+                    return thumbnail_response(
+                        id_signal="sig-stale", timestamp=pre_fetch_ts
+                    )
+                return thumbnail_response(id_signal="sig-fresh", timestamp=fresh_ts)
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst,
+            1,
+            "QR",
+            "QR01",
+            wait_for_fresh=True,
+            freshness_timeout=5.0,
+            freshness_poll_interval=0.0,
+        )
+
+        assert result.timestamp == fresh_ts
+        assert thumbnail_calls == 3  # pre-fetch + stale + fresh
+
+    async def test_wait_for_fresh_null_timestamp_treated_as_stale(
+        self, client, transport
+    ):
+        """A null-timestamp post-fetch is treated as stale and triggers retry."""
+        pre_fetch_ts = "2026-05-16 19:19:08"
+        fresh_ts = "2026-05-16 19:20:12"
+        thumbnail_calls = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal thumbnail_calls
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                thumbnail_calls += 1
+                if thumbnail_calls == 1:
+                    return thumbnail_response(timestamp=pre_fetch_ts)
+                if thumbnail_calls == 2:
+                    return thumbnail_response(id_signal=None, timestamp=None)
+                return thumbnail_response(id_signal="sig-fresh", timestamp=fresh_ts)
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst,
+            1,
+            "QR",
+            "QR01",
+            wait_for_fresh=True,
+            freshness_timeout=5.0,
+            freshness_poll_interval=0.0,
+        )
+
+        assert result.timestamp == fresh_ts
+        assert thumbnail_calls == 3
+
+    async def test_wait_for_fresh_unparseable_pre_fetch_falls_through(
+        self, client, transport
+    ):
+        """If pre-fetch returns null/unparseable timestamp, skip the freshness
+        guarantee — we have no baseline to compare against."""
+        thumbnail_calls = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal thumbnail_calls
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                thumbnail_calls += 1
+                if thumbnail_calls == 1:
+                    # Pre-fetch comes back with no metadata.
+                    return thumbnail_response(timestamp=None)
+                return thumbnail_response(
+                    id_signal="sig", timestamp="2026-05-16 19:20:12"
+                )
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst,
+            1,
+            "QR",
+            "QR01",
+            wait_for_fresh=True,
+            freshness_timeout=5.0,
+            freshness_poll_interval=0.0,
+        )
+
+        # Pre-fetch + one post-fetch only (no baseline to keep polling against).
+        assert thumbnail_calls == 2
+        assert result.id_signal == "sig"
+
+    async def test_wait_for_fresh_false_keeps_legacy_single_fetch(
+        self, client, transport
+    ):
+        """Default wait_for_fresh=False: no pre-fetch, no polling, one fetch."""
+        thumbnail_calls = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal thumbnail_calls
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                thumbnail_calls += 1
+                return thumbnail_response(
+                    id_signal="sig", timestamp="2026-05-16 19:02:32"
+                )
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(inst, 1, "QR", "QR01")
+
+        assert result.id_signal == "sig"
+        assert thumbnail_calls == 1
+
+    async def test_status_polling_default_delay_is_at_least_5s(self, client, transport):
+        """Image-status polling must default to >=5s.  Pre-refactor (before
+        173ca0e on 2026-04-09) the code explicitly slept ``max(5, ...)``
+        between RequestImagesStatus polls; the unification onto
+        _poll_operation dropped that floor and started using the general
+        2s poll_delay, producing ~40 status calls per 80s capture and
+        risking rate-limiting.  This test pins the floor back in place.
+        """
+        from unittest.mock import patch as _patch
+
+        recorded_delays: list[float] = []
+        original_sleep = asyncio.sleep
+
+        async def _record_sleep(delay: float, *args, **kwargs):
+            recorded_delays.append(delay)
+            await original_sleep(0)  # zero-wait — we only care about the value
+
+        async def _side_effect(*args, **_kwargs):
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                # WAIT then OK so the polling loop sleeps at least once.
+                if not recorded_delays:
+                    return request_images_status_response(
+                        res="OK", msg="processing image"
+                    )
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                return thumbnail_response(id_signal="sig", timestamp="2024-06-15 10:30")
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        with _patch("asyncio.sleep", _record_sleep):
+            await client.capture_image(inst, 1, "QR", "QR01")
+
+        assert any(d >= 5.0 for d in recorded_delays), (
+            f"expected at least one sleep >= 5s, got {recorded_delays}"
+        )
+
+    async def test_wait_for_fresh_returns_stale_on_timeout(self, client, transport):
+        """If the CDN never publishes anything newer, return the last fetch."""
+        pre_fetch_ts = "2026-05-16 19:19:08"
+        thumbnail_calls = 0
+
+        async def _side_effect(*args, **_kwargs):
+            nonlocal thumbnail_calls
+            content = args[0] if args else {}
+            op = content.get("operationName") if isinstance(content, dict) else None
+            if op == "RequestImages":
+                return request_images_response("ref-img-001")
+            if op == "RequestImagesStatus":
+                return request_images_status_response(res="OK", msg="completed")
+            if op == "mkGetThumbnail":
+                thumbnail_calls += 1
+                return thumbnail_response(id_signal="sig-stale", timestamp=pre_fetch_ts)
+            raise AssertionError(f"unexpected op: {op}")
+
+        transport.execute.side_effect = _side_effect
+
+        inst = _make_installation()
+        result = await client.capture_image(
+            inst,
+            1,
+            "QR",
+            "QR01",
+            wait_for_fresh=True,
+            freshness_timeout=0.1,
+            freshness_poll_interval=0.0,
+        )
+
+        # Returns stale rather than raising — caller chose a budget, we honor it.
+        assert result.timestamp == pre_fetch_ts
+        assert thumbnail_calls >= 2  # at least pre-fetch + 1 post-fetch
+
+
+# ── get_thumbnail tests ──────────────────────────────────────────────────────
+
+
+class TestGetThumbnail:
+    async def test_returns_thumbnail_response(self, client, transport):
+        """Successful call returns ThumbnailResponse."""
+        transport.execute.return_value = thumbnail_response(
+            id_signal="sig-100",
+            device_code="01",
+            device_alias="Camera 1",
+            timestamp="2024-06-15T10:30:00",
+            signal_type="IMG",
+            image="base64imagedata",
+        )
+
+        inst = _make_installation()
+        result = await client.get_thumbnail(inst, "QR", "QR01")
+
+        assert isinstance(result, ThumbnailResponse)
+        assert result.id_signal == "sig-100"
+        assert result.device_alias == "Camera 1"
+        assert result.image == "base64imagedata"
+
+
+# ── get_full_image tests ─────────────────────────────────────────────────────
+
+
+class TestGetFullImage:
+    async def test_returns_jpeg_bytes(self, client, transport):
+        """Selects the largest BINARY image and returns decoded JPEG bytes."""
+        # Create a valid JPEG (starts with 0xFF 0xD8)
+        jpeg_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        encoded = base64.b64encode(jpeg_data).decode()
+        small_jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 10
+        small_encoded = base64.b64encode(small_jpeg).decode()
+
+        transport.execute.return_value = photo_images_response(
+            devices=[
+                {
+                    "id": "1",
+                    "idSignal": "sig-100",
+                    "code": "01",
+                    "name": "Camera 1",
+                    "quality": "HIGH",
+                    "images": [
+                        {"id": "img-1", "image": small_encoded, "type": "BINARY"},
+                        {"id": "img-2", "image": encoded, "type": "BINARY"},
+                        {"id": "img-3", "image": "thumbnail-data", "type": "THUMBNAIL"},
+                    ],
+                }
+            ]
+        )
+
+        inst = _make_installation()
+        result = await client.get_full_image(inst, "sig-100", "IMG")
+
+        assert result is not None
+        assert result == jpeg_data
+        assert result[:2] == b"\xff\xd8"
+
+    async def test_returns_none_for_no_devices(self, client, transport):
+        """Returns None when no devices in response."""
+        transport.execute.return_value = photo_images_response(devices=[])
+
+        inst = _make_installation()
+        result = await client.get_full_image(inst, "sig-100", "IMG")
+
+        assert result is None
+
+    async def test_returns_none_for_no_binary_images(self, client, transport):
+        """Returns None when no BINARY type images found."""
+        transport.execute.return_value = photo_images_response(
+            devices=[
+                {
+                    "id": "1",
+                    "idSignal": "sig-100",
+                    "code": "01",
+                    "name": "Camera 1",
+                    "quality": "HIGH",
+                    "images": [
+                        {"id": "img-1", "image": "thumb-data", "type": "THUMBNAIL"},
+                    ],
+                }
+            ]
+        )
+
+        inst = _make_installation()
+        result = await client.get_full_image(inst, "sig-100", "IMG")
+
+        assert result is None
+
+    async def test_returns_decoded_bytes_for_non_jpeg(self, client, transport):
+        """Format validation moved to callers; raw decoded bytes pass through.
+
+        The camera coordinator re-checks JPEG magic before storing a
+        thumbnail; the activity-card path accepts any image format.
+        """
+        non_jpeg_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+        encoded = base64.b64encode(non_jpeg_data).decode()
+
+        transport.execute.return_value = photo_images_response(
+            devices=[
+                {
+                    "id": "1",
+                    "idSignal": "sig-100",
+                    "code": "01",
+                    "name": "Camera 1",
+                    "quality": "HIGH",
+                    "images": [
+                        {"id": "img-1", "image": encoded, "type": "BINARY"},
+                    ],
+                }
+            ]
+        )
+
+        inst = _make_installation()
+        result = await client.get_full_image(inst, "sig-100", "IMG")
+
+        assert result == non_jpeg_data
+
+    async def test_returns_none_for_none_devices(self, client, transport):
+        """Returns None when devices list is None."""
+        transport.execute.return_value = photo_images_response(devices=None)
+
+        inst = _make_installation()
+        result = await client.get_full_image(inst, "sig-100", "IMG")
+
+        assert result is None
+
+
+# ── Golden contract tests ───────────────────────────────────────────────────
+
+
+class TestCameraRequestContracts:
+    """Assert exact wire-protocol payloads for camera methods."""
+
+    async def test_get_camera_devices_payload(self, client, transport):
+        """get_camera_devices sends xSDeviceList with correct variables."""
+        transport.execute.return_value = device_list_response(devices=[])
+
+        inst = _make_installation()
+        await client.get_camera_devices(inst)
+
+        content = transport.execute.call_args_list[0][0][0]
+        assert content["operationName"] == "xSDeviceList"
+        assert content["variables"]["numinst"] == "123456"
+        assert content["variables"]["panel"] == "SDVFAST"
+
+    async def test_capture_image_submit_payload(self, client, transport):
+        """capture_image submit call sends RequestImages with correct variables."""
+        transport.execute.side_effect = [
+            request_images_response("ref-img-1"),
+            request_images_status_response(res="OK"),
+            thumbnail_response(id_signal="new-signal"),
+        ]
+
+        inst = _make_installation()
+        await client.capture_image(inst, 101, "QR", "QR01")
+
+        submit = transport.execute.call_args_list[0][0][0]
+        assert submit["operationName"] == "RequestImages"
+        assert submit["variables"]["numinst"] == "123456"
+        assert submit["variables"]["panel"] == "SDVFAST"
+        assert submit["variables"]["devices"] == [101]
+        assert submit["variables"]["resolution"] == 0
+        assert submit["variables"]["mediaType"] == 1
+        assert submit["variables"]["deviceType"] == 106
+
+    async def test_capture_image_device_type_mapping(self, client, transport):
+        """capture_image maps device types to correct integer codes."""
+        mapping = {"QR": 106, "YR": 106, "YP": 103, "QP": 107}
+
+        for device_type, expected_code in mapping.items():
+            transport.execute.reset_mock()
+            transport.execute.side_effect = [
+                request_images_response("ref-img-1"),
+                request_images_status_response(res="OK"),
+                thumbnail_response(id_signal="new-signal"),
+            ]
+
+            inst = _make_installation()
+            await client.capture_image(inst, 1, device_type, f"{device_type}01")
+
+            submit = transport.execute.call_args_list[0][0][0]
+            assert submit["variables"]["deviceType"] == expected_code, (
+                f"device_type={device_type} should map to {expected_code}"
+            )
+
+    async def test_capture_image_status_poll_payload(self, client, transport):
+        """capture_image status poll sends correct variables with counter."""
+        transport.execute.side_effect = [
+            # 1. Submit capture request
+            request_images_response("ref-img-1"),
+            # 2. Status poll: still processing
+            request_images_status_response(res="WAIT", msg="processing image"),
+            # 3. Status poll: done
+            request_images_status_response(res="OK"),
+            # 4. Fetch thumbnail after status done
+            thumbnail_response(id_signal="new-signal"),
+        ]
+
+        inst = _make_installation()
+        await client.capture_image(inst, 101, "QR", "QR01")
+
+        # Call index 1 = first status poll (counter=1)
+        status_call = transport.execute.call_args_list[1][0][0]
+        assert status_call["operationName"] == "RequestImagesStatus"
+        assert status_call["variables"]["numinst"] == "123456"
+        assert status_call["variables"]["panel"] == "SDVFAST"
+        assert status_call["variables"]["devices"] == [101]
+        assert status_call["variables"]["referenceId"] == "ref-img-1"
+        assert status_call["variables"]["counter"] == 1
+
+    async def test_get_thumbnail_payload(self, client, transport):
+        """get_thumbnail sends mkGetThumbnail with correct variables."""
+        transport.execute.return_value = thumbnail_response()
+
+        inst = _make_installation()
+        await client.get_thumbnail(inst, "QR", "QR01")
+
+        content = transport.execute.call_args_list[0][0][0]
+        assert content["operationName"] == "mkGetThumbnail"
+        assert content["variables"]["numinst"] == "123456"
+        assert content["variables"]["panel"] == "SDVFAST"
+        assert content["variables"]["device"] == "QR"
+        assert content["variables"]["zoneId"] == "QR01"
+
+    async def test_get_full_image_payload(self, client, transport):
+        """get_full_image sends mkGetPhotoImages with correct variables."""
+        jpeg_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        encoded = base64.b64encode(jpeg_data).decode()
+
+        transport.execute.return_value = photo_images_response(
+            devices=[
+                {
+                    "id": "1",
+                    "idSignal": "signal-123",
+                    "code": "01",
+                    "name": "Camera 1",
+                    "quality": "HIGH",
+                    "images": [
+                        {"id": "img-1", "image": encoded, "type": "BINARY"},
+                    ],
+                }
+            ]
+        )
+
+        inst = _make_installation()
+        await client.get_full_image(inst, "signal-123", "ALARM")
+
+        content = transport.execute.call_args_list[0][0][0]
+        assert content["operationName"] == "mkGetPhotoImages"
+        assert content["variables"]["numinst"] == "123456"
+        assert content["variables"]["idSignal"] == "signal-123"
+        assert content["variables"]["signalType"] == "ALARM"
+        assert content["variables"]["panel"] == "SDVFAST"

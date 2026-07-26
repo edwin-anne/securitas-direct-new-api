@@ -1,0 +1,2161 @@
+"""Tests for custom_components/verisure_owa/__init__.py."""
+
+import contextlib
+from collections import OrderedDict
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from homeassistant.const import (
+    CONF_CODE,
+    CONF_DEVICE_ID,
+    CONF_PASSWORD,
+    CONF_SCAN_INTERVAL,
+    CONF_UNIQUE_ID,
+    CONF_USERNAME,
+)
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+from custom_components.securitas import (
+    CONF_CODE_ARM_REQUIRED,
+    CONF_COUNTRY,
+    CONF_DELAY_CHECK_OPERATION,
+    CONF_DEVICE_INDIGITALL,
+    CONF_FORCE_ARM_NOTIFICATIONS,
+    CONF_INSTALLATION,
+    CONF_MAP_AWAY,
+    CONF_MAP_CUSTOM,
+    CONF_MAP_HOME,
+    CONF_MAP_NIGHT,
+    CONF_MAP_VACATION,
+    CONF_NOTIFY_GROUP,
+    DOMAIN,
+    PLATFORMS,
+    VerisureDevice,
+    VerisureHub,
+    _build_config_dict,
+    add_device_information,
+    async_migrate_entry,
+    async_setup_entry,
+    async_unload_entry,
+    async_update_options,
+)
+from custom_components.securitas.hub import (
+    _async_notify,
+    _notify,
+)
+from custom_components.securitas.verisure_owa_api.const import (
+    STD_DEFAULTS,
+)
+from custom_components.securitas.verisure_owa_api.exceptions import (
+    AuthenticationError,
+    TwoFactorRequiredError,
+    VerisureOwaError,
+)
+from tests.conftest import (
+    make_config_entry_data,
+    make_installation,
+    make_securitas_hub_mock,
+)
+
+# ---------------------------------------------------------------------------
+# Helper: patch VerisureHub preserving __name__
+# ---------------------------------------------------------------------------
+
+
+def _patch_hub(mock_hub):
+    """Patch VerisureHub constructor to return mock_hub while preserving __name__.
+
+    MagicMock does not have a proper __name__ attribute, so we set it
+    to make the mock behave like a real class.
+    """
+    mock_cls = MagicMock(return_value=mock_hub)
+    mock_cls.__name__ = "VerisureHub"
+    return patch("custom_components.securitas.VerisureHub", mock_cls)
+
+
+# ===========================================================================
+# 1. TestAddDeviceInformation
+# ===========================================================================
+
+
+class TestAddDeviceInformation:
+    """Tests for add_device_information() pure function."""
+
+    def test_generates_device_id_when_missing(self):
+        """Should generate a device_id when not present in config."""
+        config = OrderedDict({CONF_COUNTRY: "ES"})
+        result = add_device_information(config)
+        assert CONF_DEVICE_ID in result
+        assert isinstance(result[CONF_DEVICE_ID], str)
+        assert len(result[CONF_DEVICE_ID]) > 0
+
+    def test_generates_unique_id_when_missing(self):
+        """Should generate a unique_id when not present in config."""
+        config = OrderedDict({CONF_COUNTRY: "ES"})
+        result = add_device_information(config)
+        assert CONF_UNIQUE_ID in result
+        assert isinstance(result[CONF_UNIQUE_ID], str)
+        assert len(result[CONF_UNIQUE_ID]) > 0
+
+    def test_generates_indigitall_when_missing(self):
+        """Should generate an indigitall device id when not present."""
+        config = OrderedDict({CONF_COUNTRY: "ES"})
+        result = add_device_information(config)
+        assert CONF_DEVICE_INDIGITALL in result
+        assert isinstance(result[CONF_DEVICE_INDIGITALL], str)
+        # UUID4 has hyphens and is 36 chars
+        assert len(result[CONF_DEVICE_INDIGITALL]) == 36
+
+    def test_preserves_existing_values(self):
+        """Should not overwrite existing device_id, unique_id, indigitall."""
+        config = OrderedDict(
+            {
+                CONF_COUNTRY: "ES",
+                CONF_DEVICE_ID: "my-device-id",
+                CONF_UNIQUE_ID: "my-unique-id",
+                CONF_DEVICE_INDIGITALL: "my-indigitall",
+            }
+        )
+        result = add_device_information(config)
+        assert result[CONF_DEVICE_ID] == "my-device-id"
+        assert result[CONF_UNIQUE_ID] == "my-unique-id"
+        assert result[CONF_DEVICE_INDIGITALL] == "my-indigitall"
+
+
+# ===========================================================================
+# 1b. TestVerisureHubInit — real constructor, catches missing config keys
+# ===========================================================================
+
+
+class TestVerisureHubInit:
+    """Verify VerisureHub.__init__ works with config dicts from various sources."""
+
+    def test_hub_init_with_config_entry_data(self, hass):
+        """VerisureHub.__init__ should accept make_config_entry_data() without KeyError."""
+        config = make_config_entry_data()
+        hub = VerisureHub(config, None, MagicMock(), hass)
+        assert hub.country == "ES"
+
+    def test_hub_init_with_minimal_config_flow_config(self, hass):
+        """VerisureHub.__init__ should accept the config dict built by _create_client."""
+        from custom_components.securitas import (
+            DEFAULT_DELAY_CHECK_OPERATION,
+        )
+
+        # Simulate the config dict built by async_step_user before _create_client()
+        config = OrderedDict(
+            {
+                CONF_COUNTRY: "ES",
+                CONF_USERNAME: "test@example.com",
+                CONF_PASSWORD: "test-password",
+                CONF_DELAY_CHECK_OPERATION: DEFAULT_DELAY_CHECK_OPERATION,
+                CONF_DEVICE_ID: "test-device-id",
+                CONF_UNIQUE_ID: "test-uuid",
+                CONF_DEVICE_INDIGITALL: "",
+            }
+        )
+        hub = VerisureHub(config, None, MagicMock(), hass)
+        assert hub.country == "ES"
+
+
+# ===========================================================================
+# 2. TestAsyncNotify — translated persistent notifications
+# ===========================================================================
+
+
+class TestAsyncNotify:
+    """Tests for _async_notify() and _notify() helpers."""
+
+    async def test_looks_up_title_and_message_from_translations_dict(self):
+        """Resolves title/message via get_notification_strings and posts to persistent_notification."""
+        hass = MagicMock()
+        hass.config.language = "en"
+        hass.services.async_call = AsyncMock()
+
+        with patch(
+            "custom_components.securitas.hub.get_notification_strings",
+            return_value={"title": "Hello", "message": "World message"},
+        ) as mocked:
+            await _async_notify(hass, "my_id", "my_key")
+
+        mocked.assert_called_once_with(hass, "my_key")
+        hass.services.async_call.assert_awaited_once_with(
+            domain="persistent_notification",
+            service="create",
+            service_data={
+                "title": "Hello",
+                "message": "World message",
+                "notification_id": f"{DOMAIN}.my_id",
+            },
+        )
+
+    async def test_interpolates_placeholders_into_title_and_message(self):
+        """Placeholders are substituted in both title and message."""
+        hass = MagicMock()
+        hass.config.language = "es"
+        hass.services.async_call = AsyncMock()
+
+        with patch(
+            "custom_components.securitas.hub.get_notification_strings",
+            return_value={"title": "Hola {name}", "message": "{count} cosas"},
+        ):
+            await _async_notify(hass, "g1", "greeting", {"name": "Bob", "count": 3})
+
+        service_data = hass.services.async_call.call_args[1]["service_data"]
+        assert service_data["title"] == "Hola Bob"
+        assert service_data["message"] == "3 cosas"
+
+    def test_notify_sync_wrapper_schedules_async_notify(self):
+        """_notify() schedules _async_notify via hass.async_create_task."""
+        hass = MagicMock()
+        hass.async_create_task = MagicMock()
+        _notify(hass, "id1", "key1", {"x": "y"})
+        hass.async_create_task.assert_called_once()
+        coro = hass.async_create_task.call_args[0][0]
+        # Coroutine is the _async_notify call — close it to avoid RuntimeWarning
+        coro.close()
+
+
+# ===========================================================================
+# 3. TestVerisureDevice
+# ===========================================================================
+
+
+class TestVerisureDevice:
+    """Tests for the VerisureDevice wrapper class."""
+
+    def _make_device(self, **overrides) -> VerisureDevice:
+        installation = make_installation(**overrides)
+        return VerisureDevice(installation)
+
+    def test_available_returns_true(self):
+        """Device should always report as available."""
+        device = self._make_device()
+        assert device.available is True
+
+    def test_device_id_returns_installation_number(self):
+        """device_id should return the installation number."""
+        device = self._make_device(number="999888")
+        assert device.device_id == "999888"
+
+    def test_address_returns_installation_address(self):
+        """address should return the installation address."""
+        device = self._make_device(address="42 Elm Street")
+        assert device.address == "42 Elm Street"
+
+    def test_city_returns_installation_city(self):
+        """city should return the installation city."""
+        device = self._make_device(city="Barcelona")
+        assert device.city == "Barcelona"
+
+    def test_postal_code_returns_installation_postal_code(self):
+        """postal_code should return the installation postalCode."""
+        device = self._make_device(postal_code="08001")
+        assert device.postal_code == "08001"
+
+    def test_device_info_structure(self):
+        """device_info should return a valid DeviceInfo dict."""
+        device = self._make_device(alias="MyHome", type="PREMIUM", panel="SDVFAST")
+        info = device.device_info
+        assert info["identifiers"] == {(DOMAIN, "v4_securitas_direct.123456")}  # type: ignore[typeddict-item]
+        assert info["manufacturer"] == "Verisure"  # type: ignore[typeddict-item]
+        assert info["model"] == "SDVFAST"  # type: ignore[typeddict-item]
+        assert info["hw_version"] == "PREMIUM"  # type: ignore[typeddict-item]
+        assert info["name"] == "MyHome"  # type: ignore[typeddict-item]
+
+
+# ===========================================================================
+# 4. TestVerisureHub
+# ===========================================================================
+
+
+class TestVerisureHub:
+    """Tests for the VerisureHub wrapper class."""
+
+    def _make_config(self, **overrides) -> OrderedDict:
+        """Build a minimal config OrderedDict for VerisureHub."""
+        config = OrderedDict(
+            {
+                CONF_USERNAME: "test@example.com",
+                CONF_PASSWORD: "test-password",
+                CONF_COUNTRY: "ES",
+                CONF_DEVICE_ID: "test-device-id",
+                CONF_UNIQUE_ID: "test-uuid",
+                CONF_DEVICE_INDIGITALL: "test-indigitall",
+                CONF_DELAY_CHECK_OPERATION: 2,
+                CONF_SCAN_INTERVAL: 120,
+                CONF_CODE: "",
+                CONF_CODE_ARM_REQUIRED: False,
+            }
+        )
+        config.update(overrides)
+        return config
+
+    def _make_hub(self, config=None, **config_overrides) -> VerisureHub:
+        """Create a VerisureHub with mocked dependencies."""
+        if config is None:
+            config = self._make_config(**config_overrides)
+        return VerisureHub(config, MagicMock(), MagicMock(), MagicMock())
+
+    def test_init_creates_api_manager(self):
+        """Constructor should create a VerisureOwaClient."""
+        hub = self._make_hub()
+        assert hub.client is not None
+        assert hub.config[CONF_USERNAME] == "test@example.com"
+        assert hub.country == "ES"
+
+    def test_init_stores_config(self):
+        """Constructor should store the domain config."""
+        config = self._make_config()
+        hub = VerisureHub(config, MagicMock(), MagicMock(), MagicMock())
+        assert hub.config is config
+
+    async def test_login_delegates_to_session(self):
+        """login() should delegate to session.login() when no refresh token is available."""
+        hub = self._make_hub()
+        hub.client = AsyncMock()
+        hub.client.refresh_token_value = ""
+        await hub.login()
+        hub.client.login.assert_awaited_once()
+
+    async def test_validate_device_delegates(self):
+        """validate_device() should delegate to session.validate_device()."""
+        hub = self._make_hub()
+        hub.client = AsyncMock()
+        hub.client.validate_device = AsyncMock(return_value=("hash", []))
+        result = await hub.validate_device()
+        hub.client.validate_device.assert_awaited_once_with(False, "", "")
+        assert result == ("hash", [])
+
+    async def test_send_sms_code_delegates(self):
+        """send_sms_code() should delegate to session.validate_device() with correct args."""
+        hub = self._make_hub()
+        hub.client = AsyncMock()
+        hub.client.validate_device = AsyncMock(return_value=("hash", []))
+        await hub.send_sms_code("otp-hash", "123456")
+        hub.client.validate_device.assert_awaited_once_with(True, "otp-hash", "123456")
+
+    async def test_refresh_token_delegates(self):
+        """refresh_token() should delegate to session.refresh_token()."""
+        hub = self._make_hub()
+        hub.client = AsyncMock()
+        hub.client.refresh_token = AsyncMock(return_value=True)
+        result = await hub.refresh_token()
+        hub.client.refresh_token.assert_awaited_once()
+        assert result is True
+
+    async def test_get_services_delegates(self):
+        """get_services() should delegate to session.get_all_services()."""
+        hub = self._make_hub()
+        hub.client = AsyncMock()
+        hub.client.get_services = AsyncMock(return_value=[])
+        inst = make_installation()
+        result = await hub.get_services(inst)
+        hub.client.get_services.assert_awaited_once_with(inst)
+        assert result == []
+
+    def test_get_authentication_token(self):
+        """get_authentication_token should read session.authentication_token."""
+        hub = self._make_hub()
+        hub.client = MagicMock()
+        hub.client.authentication_token = "original-token"
+        assert hub.get_authentication_token() == "original-token"
+
+
+# ===========================================================================
+# 5. TestAsyncSetupEntry
+# ===========================================================================
+
+
+class TestAsyncSetupEntry:
+    """Tests for async_setup_entry()."""
+
+    @pytest.fixture
+    def mock_hub(self):
+        """Create a mock VerisureHub for setup tests."""
+        hub = make_securitas_hub_mock()
+        hub.client.list_installations = AsyncMock(return_value=[make_installation()])
+        return hub
+
+    async def test_setup_success(self, hass, mock_hub):
+        """Successful setup should login, list installations, forward platforms, return True."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        mock_hub.login.assert_awaited_once()
+        mock_hub.client.list_installations.assert_awaited_once()
+        assert DOMAIN in hass.data
+        assert entry.entry_id in hass.data[DOMAIN]
+        assert "hub" in hass.data[DOMAIN][entry.entry_id]
+        assert "devices" in hass.data[DOMAIN][entry.entry_id]
+
+    async def test_setup_succeeds_with_refresh_token_only_entry(self, hass, mock_hub):
+        """Refresh-token-shape entries (no CONF_PASSWORD) must set up cleanly."""
+        from custom_components.securitas.const import CONF_REFRESH_TOKEN
+
+        data = make_config_entry_data()
+        data.pop(CONF_PASSWORD)
+        data[CONF_REFRESH_TOKEN] = "persisted-refresh-token"
+
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+
+    async def test_setup_login_2fa_error(self, hass, mock_hub):
+        """TwoFactorRequiredError raises ConfigEntryAuthFailed and notifies via translation key."""
+        mock_hub.login = AsyncMock(side_effect=TwoFactorRequiredError("2FA required"))
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch("custom_components.securitas._notify") as mock_notify,
+            pytest.raises(ConfigEntryAuthFailed, match="2FA required"),
+        ):
+            await async_setup_entry(hass, entry)
+
+        mock_notify.assert_called_once_with(hass, "2fa_error", "two_factor_required")
+
+    async def test_setup_login_error(self, hass, mock_hub):
+        """AuthenticationError raises ConfigEntryAuthFailed and notifies with the API error."""
+        mock_hub.login = AsyncMock(side_effect=AuthenticationError("bad credentials"))
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch("custom_components.securitas._notify") as mock_notify,
+            pytest.raises(ConfigEntryAuthFailed, match="Authentication failed"),
+        ):
+            await async_setup_entry(hass, entry)
+
+        mock_notify.assert_called_once_with(
+            hass, "login_error", "login_failed", {"error": "bad credentials"}
+        )
+
+    async def test_setup_securitas_error_during_login(self, hass, mock_hub):
+        """VerisureOwaError during login should raise ConfigEntryNotReady."""
+        mock_hub.login = AsyncMock(side_effect=VerisureOwaError("connection failed"))
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            pytest.raises(ConfigEntryNotReady),
+        ):
+            await async_setup_entry(hass, entry)
+
+    async def test_setup_login_error_does_not_leak_response_body(self, hass, mock_hub):
+        """User-facing ConfigEntryNotReady must not embed raw response body.
+
+        log_detail() may include the raw API response (which can contain
+        tokens) for unknown errors. That detail belongs in the (filtered)
+        log, not in the user-facing exception text.
+        """
+        err = VerisureOwaError("connection failed")
+        err.response_body = {
+            "data": {"hash": "leaked-auth-token-value"},
+        }
+        mock_hub.login = AsyncMock(side_effect=err)
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            pytest.raises(ConfigEntryNotReady) as exc_info,
+        ):
+            await async_setup_entry(hass, entry)
+
+        # Token must not appear in the user-facing message
+        assert "leaked-auth-token-value" not in str(exc_info.value)
+
+    async def test_setup_securitas_error_during_list_installations(
+        self, hass, mock_hub
+    ):
+        """VerisureOwaError during list_installations should raise ConfigEntryNotReady."""
+        mock_hub.client.list_installations = AsyncMock(
+            side_effect=VerisureOwaError("network error")
+        )
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            pytest.raises(ConfigEntryNotReady),
+        ):
+            await async_setup_entry(hass, entry)
+
+    async def test_setup_missing_device_id_raises_not_ready(self, hass):
+        """Missing CONF_DEVICE_ID should raise ConfigEntryNotReady."""
+        data = make_config_entry_data()
+        del data[CONF_DEVICE_ID]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, entry)
+
+    async def test_setup_missing_unique_id_raises_not_ready(self, hass):
+        """Missing CONF_UNIQUE_ID should raise ConfigEntryNotReady."""
+        data = make_config_entry_data()
+        del data[CONF_UNIQUE_ID]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, entry)
+
+    async def test_setup_missing_indigitall_raises_not_ready(self, hass):
+        """Missing CONF_DEVICE_INDIGITALL should raise ConfigEntryNotReady."""
+        data = make_config_entry_data()
+        del data[CONF_DEVICE_INDIGITALL]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with pytest.raises(ConfigEntryNotReady):
+            await async_setup_entry(hass, entry)
+
+    async def test_setup_stores_hub_in_hass_data(self, hass, mock_hub):
+        """After successful setup, VerisureHub should be stored in per-entry data."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        assert hass.data[DOMAIN][entry.entry_id]["hub"] is mock_hub
+
+    async def test_setup_stores_devices_in_hass_data(self, hass, mock_hub):
+        """After successful setup, devices list should be in per-entry data."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        devices = hass.data[DOMAIN][entry.entry_id]["devices"]
+        assert len(devices) == 1
+        assert isinstance(devices[0], VerisureDevice)
+
+    async def test_setup_no_migration_when_maps_present(self, hass, mock_hub):
+        """When map_home already has a value, no migration should happen."""
+        data = make_config_entry_data()
+        # Make sure maps have values (they do by default from make_config_entry_data)
+        assert data[CONF_MAP_HOME] is not None
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        # data should remain as it was
+        assert entry.data[CONF_MAP_HOME] == STD_DEFAULTS[CONF_MAP_HOME]
+
+    async def test_setup_forwards_platforms(self, hass, mock_hub):
+        """Successful setup should forward all PLATFORMS."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ) as mock_forward,
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        mock_forward.assert_awaited_once_with(entry, PLATFORMS)
+
+    async def test_setup_registers_static_path_and_extra_js(self, hass, mock_hub):
+        """Successful setup should register the alarm card static path and JS URL."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        # Make hass.http truthy with an async_register_static_paths mock
+        hass.http = MagicMock()
+        hass.http.async_register_static_paths = AsyncMock()
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.securitas.frontend.add_extra_js_url"
+            ) as mock_add_js,
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+
+        # Verify static path registration (both new and legacy paths)
+        hass.http.async_register_static_paths.assert_awaited_once()
+        call_args = hass.http.async_register_static_paths.call_args[0][0]
+        assert len(call_args) == 2
+        paths = [cfg.url_path for cfg in call_args]
+        assert "/verisure-owa-panel" in paths
+        assert "/securitas_panel" in paths
+
+        # Verify all card JS URLs are registered (alarm + chip + camera + events)
+        assert mock_add_js.call_count == 4
+        js_urls = [call[0][1] for call in mock_add_js.call_args_list]
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-alarm-card.js?v=")
+            for u in js_urls
+        )
+        # The lightweight chip/badge module is registered as its own resource so
+        # the always-visible alarm chip renders without first downloading the
+        # heavy alarm-card bundle.
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-alarm-chip.js?v=")
+            for u in js_urls
+        )
+        # ...and it must be registered BEFORE the heavy alarm card: in the
+        # add_extra_js_url fallback, resources inject as ordered
+        # <script type="module"> tags that execute in document order, so the
+        # lightweight chip must come first to render ASAP on cold load.
+        chip_idx = next(
+            i for i, u in enumerate(js_urls) if "verisure-owa-alarm-chip.js" in u
+        )
+        card_idx = next(
+            i for i, u in enumerate(js_urls) if "verisure-owa-alarm-card.js" in u
+        )
+        assert chip_idx < card_idx, (
+            f"chip ({chip_idx}) must register before card ({card_idx}) so it "
+            "loads first in the add_extra_js_url fallback"
+        )
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-camera-card.js?v=")
+            for u in js_urls
+        )
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-activity-log-card.js?v=")
+            for u in js_urls
+        )
+
+    async def test_setup_static_paths_cache_policy(self, hass, mock_hub):
+        """Static paths use a differential cache policy.
+
+        ``/verisure-owa-panel`` (cache_headers=True): the integration only ever
+        emits cache-busted URLs here — entry points via ``_card_url``
+        (``?v=<hash>-<version>``) and their bare imports via a ``?v=<version>``
+        query stamped in the JS (enforced by
+        tests-js/integration/card-cache-busting.test.js) — so a long max-age is
+        safe and gives the cold-load speed-up (the alarm chip no longer renders
+        5-10s late).
+
+        ``/securitas_panel`` (cache_headers=False): legacy path for pre-v5 URLs
+        users hardcoded into resources/Markdown cards. Those URLs carry NO
+        ``?v=`` bust token, so a long max-age would pin them stale ~31 days
+        after an update; revalidation keeps them fresh.
+        """
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        hass.http = MagicMock()
+        hass.http.async_register_static_paths = AsyncMock()
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+            patch("custom_components.securitas.frontend.add_extra_js_url"),
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        hass.http.async_register_static_paths.assert_awaited_once()
+        call_args = hass.http.async_register_static_paths.call_args[0][0]
+        cache_by_path = {cfg.url_path: cfg.cache_headers for cfg in call_args}
+        assert cache_by_path == {
+            "/verisure-owa-panel": True,
+            "/securitas_panel": False,
+        }, cache_by_path
+
+    async def test_setup_skips_card_when_no_http(self, hass, mock_hub):
+        """When hass.http is None, neither static paths nor extra JS should be registered."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        hass.http = None
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.securitas.frontend.add_extra_js_url"
+            ) as mock_add_js,
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        mock_add_js.assert_not_called()
+
+    async def test_setup_card_registration_idempotent(self, hass, mock_hub):
+        """Calling async_setup_entry twice should only register card JS once."""
+        # Make hass.http truthy with an async_register_static_paths mock
+        hass.http = MagicMock()
+        hass.http.async_register_static_paths = AsyncMock()
+
+        entry1 = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry1.add_to_hass(hass)
+
+        entry2 = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry2.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.securitas.frontend.add_extra_js_url"
+            ) as mock_add_js,
+        ):
+            result1 = await async_setup_entry(hass, entry1)
+            result2 = await async_setup_entry(hass, entry2)
+
+        assert result1 is True
+        assert result2 is True
+        # All card resources registered exactly once despite two setup calls
+        # (guarded by card_registered flag)
+        assert mock_add_js.call_count == 4
+        js_urls = [call[0][1] for call in mock_add_js.call_args_list]
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-alarm-card.js?v=")
+            for u in js_urls
+        )
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-camera-card.js?v=")
+            for u in js_urls
+        )
+        assert any(
+            u.startswith("/verisure-owa-panel/verisure-owa-activity-log-card.js?v=")
+            for u in js_urls
+        )
+
+    async def test_two_accounts_each_fetches_own_installations(self, hass):
+        """Two entries with different usernames must not share installations_cache.
+
+        Regression test: previously installations_cache was a single global key,
+        so the second entry would reuse the first entry's (wrong) list, find no
+        matching installation number, and leave its entities unavailable.
+        """
+        italian_installation = make_installation(number="1111", alias="Gran Via")
+        spanish_installation = make_installation(number="2222", alias="Rome")
+
+        italian_hub = make_securitas_hub_mock()
+        italian_hub.client.list_installations = AsyncMock(
+            return_value=[italian_installation]
+        )
+        italian_hub.client.get_services = AsyncMock(return_value=[])
+
+        spanish_hub = make_securitas_hub_mock()
+        spanish_hub.client.list_installations = AsyncMock(
+            return_value=[spanish_installation]
+        )
+        spanish_hub.client.get_services = AsyncMock(return_value=[])
+
+        italian_data = make_config_entry_data(username="italian@example.com")
+        italian_data[CONF_INSTALLATION] = "1111"
+        spanish_data = make_config_entry_data(username="spanish@example.com")
+        spanish_data[CONF_INSTALLATION] = "2222"
+
+        entry_it = MockConfigEntry(domain=DOMAIN, data=italian_data)
+        entry_it.add_to_hass(hass)
+        entry_es = MockConfigEntry(domain=DOMAIN, data=spanish_data)
+        entry_es.add_to_hass(hass)
+
+        hubs_by_username = {
+            "italian@example.com": italian_hub,
+            "spanish@example.com": spanish_hub,
+        }
+
+        def hub_factory(config, entry, *args, **kwargs):
+            return hubs_by_username[config[CONF_USERNAME]]
+
+        mock_hub_cls = MagicMock(side_effect=hub_factory)
+        mock_hub_cls.__name__ = "VerisureHub"
+
+        with (
+            patch("custom_components.securitas.VerisureHub", mock_hub_cls),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result_it = await async_setup_entry(hass, entry_it)
+            result_es = await async_setup_entry(hass, entry_es)
+
+        assert result_it is True
+        assert result_es is True
+
+        # Each hub must have fetched its own installation list exactly once
+        italian_hub.client.list_installations.assert_awaited_once()
+        spanish_hub.client.list_installations.assert_awaited_once()
+
+        # Each entry must have exactly one device (its own installation)
+        it_devices = hass.data[DOMAIN][entry_it.entry_id]["devices"]
+        es_devices = hass.data[DOMAIN][entry_es.entry_id]["devices"]
+        assert len(it_devices) == 1
+        assert it_devices[0].installation.number == "1111"
+        assert len(es_devices) == 1
+        assert es_devices[0].installation.number == "2222"
+
+
+# ===========================================================================
+# 5b. TestBuildConfigDict
+# ===========================================================================
+
+
+class TestBuildConfigDict:
+    """Tests for _build_config_dict() helper."""
+
+    def test_builds_config_from_entry_data(self):
+        """Should build config dict with all expected keys."""
+        data = make_config_entry_data()
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        config, need_sign_in = _build_config_dict(entry)
+        assert config[CONF_USERNAME] == data[CONF_USERNAME]
+        assert config[CONF_PASSWORD] == data[CONF_PASSWORD]
+        assert config[CONF_COUNTRY] == data.get(CONF_COUNTRY)
+        assert need_sign_in is False
+
+    def test_need_sign_in_when_device_id_missing(self):
+        """Should set need_sign_in=True when CONF_DEVICE_ID is missing."""
+        data = make_config_entry_data()
+        del data[CONF_DEVICE_ID]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        _, need_sign_in = _build_config_dict(entry)
+        assert need_sign_in is True
+
+    def test_need_sign_in_when_unique_id_missing(self):
+        """Should set need_sign_in=True when CONF_UNIQUE_ID is missing."""
+        data = make_config_entry_data()
+        del data[CONF_UNIQUE_ID]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        _, need_sign_in = _build_config_dict(entry)
+        assert need_sign_in is True
+
+    def test_need_sign_in_when_indigitall_missing(self):
+        """Should set need_sign_in=True when CONF_DEVICE_INDIGITALL is missing."""
+        data = make_config_entry_data()
+        del data[CONF_DEVICE_INDIGITALL]
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        _, need_sign_in = _build_config_dict(entry)
+        assert need_sign_in is True
+
+    def test_options_override_data(self):
+        """Options should override data values."""
+        data = make_config_entry_data(code="1111")
+        entry = MockConfigEntry(domain=DOMAIN, data=data, options={CONF_CODE: "9999"})
+        config, _ = _build_config_dict(entry)
+        assert config[CONF_CODE] == "9999"
+
+    def test_mapping_config_included(self):
+        """Map config keys should be in the returned config."""
+        data = make_config_entry_data()
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        config, _ = _build_config_dict(entry)
+        assert CONF_MAP_HOME in config
+        assert CONF_MAP_AWAY in config
+        assert CONF_MAP_NIGHT in config
+        assert CONF_MAP_CUSTOM in config
+        assert CONF_MAP_VACATION in config
+
+
+# ===========================================================================
+# 5c. TestMaxPollAttempts
+# ===========================================================================
+
+
+# ===========================================================================
+# 5d. TestValidateAndStoreImage
+# ===========================================================================
+
+
+class TestValidateAndStoreImage:
+    """Tests for VerisureHub._validate_and_store_image()."""
+
+    def _make_hub(self):
+        config = OrderedDict(
+            {
+                CONF_USERNAME: "test@example.com",
+                CONF_PASSWORD: "test-password",
+                CONF_COUNTRY: "ES",
+                CONF_DEVICE_ID: "test-device-id",
+                CONF_UNIQUE_ID: "test-uuid",
+                CONF_DEVICE_INDIGITALL: "test-indigitall",
+                CONF_DELAY_CHECK_OPERATION: 2,
+                CONF_SCAN_INTERVAL: 120,
+                CONF_CODE: "",
+                CONF_CODE_ARM_REQUIRED: False,
+            }
+        )
+        return VerisureHub(config, MagicMock(), MagicMock(), MagicMock())
+
+    def test_none_thumbnail_returns_none(self):
+        """None thumbnail should return None."""
+        hub = self._make_hub()
+        inst = make_installation()
+        result = hub._validate_and_store_image(None, inst, MagicMock())
+        assert result is None
+
+    def test_none_image_returns_none(self):
+        """Thumbnail with None image should return None."""
+        hub = self._make_hub()
+        inst = make_installation()
+        thumbnail = MagicMock()
+        thumbnail.image = None
+        result = hub._validate_and_store_image(thumbnail, inst, MagicMock())
+        assert result is None
+
+    def test_valid_jpeg_stored(self):
+        """Valid JPEG data should be stored and returned."""
+        import base64
+
+        hub = self._make_hub()
+        inst = make_installation(number="123")
+        camera = MagicMock()
+        camera.zone_id = "Z1"
+        camera.name = "Camera1"
+        jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        thumbnail = MagicMock()
+        thumbnail.image = base64.b64encode(jpeg_bytes).decode()
+        thumbnail.timestamp = "2024-01-01T00:00:00"
+        result = hub._validate_and_store_image(thumbnail, inst, camera)
+        assert result == jpeg_bytes
+        assert hub.camera_images["123_Z1"] == jpeg_bytes
+        assert hub.camera_timestamps["123_Z1"] == "2024-01-01T00:00:00"
+
+    def test_invalid_jpeg_returns_none(self):
+        """Non-JPEG data should return None."""
+        import base64
+
+        hub = self._make_hub()
+        inst = make_installation(number="123")
+        camera = MagicMock()
+        camera.zone_id = "Z1"
+        camera.name = "Camera1"
+        thumbnail = MagicMock()
+        thumbnail.image = base64.b64encode(b"NOT_JPEG_DATA").decode()
+        result = hub._validate_and_store_image(
+            thumbnail, inst, camera, log_warnings=False
+        )
+        assert result is None
+        assert "123_Z1" not in hub.camera_images
+
+
+# ===========================================================================
+# 6. TestAsyncUpdateOptions
+# ===========================================================================
+
+
+class TestAsyncUpdateOptions:
+    """Tests for async_update_options()."""
+
+    async def test_reload_when_options_differ(self, hass):
+        """Should reload when options differ from data."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=make_config_entry_data(scan_interval=120),
+            options={CONF_SCAN_INTERVAL: 300},
+        )
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_no_reload_when_options_same(self, hass):
+        """Should not reload when options match data."""
+        data = make_config_entry_data()
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=data,
+            options={
+                CONF_CODE: data[CONF_CODE],
+                CONF_CODE_ARM_REQUIRED: data[CONF_CODE_ARM_REQUIRED],
+                CONF_SCAN_INTERVAL: data[CONF_SCAN_INTERVAL],
+                CONF_MAP_HOME: data[CONF_MAP_HOME],
+                CONF_MAP_AWAY: data[CONF_MAP_AWAY],
+                CONF_MAP_NIGHT: data[CONF_MAP_NIGHT],
+                **{
+                    k: data[k]
+                    for k in (CONF_MAP_CUSTOM, CONF_MAP_VACATION)
+                    if k in data
+                },
+                CONF_NOTIFY_GROUP: "",
+                CONF_FORCE_ARM_NOTIFICATIONS: data[CONF_FORCE_ARM_NOTIFICATIONS],
+            },
+        )
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_not_awaited()
+
+    async def test_reload_when_notify_group_changes(self, hass):
+        """Should reload when only notify_group changes."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=make_config_entry_data(),
+            options={CONF_NOTIFY_GROUP: "notify.mobile_app"},
+        )
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_reload_when_map_vacation_changes(self, hass):
+        """Should reload when map_vacation option changes."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=make_config_entry_data(),
+            options={CONF_MAP_VACATION: "total"},
+        )
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_reload_when_code_changes(self, hass):
+        """Should reload when just the code option changes."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=make_config_entry_data(code=""),
+            options={CONF_CODE: "1234"},
+        )
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_reload_when_lock_automations_changes(self, hass):
+        """Adding per-lock automation config (with all other settings matching)
+        must trigger a config-entry reload so the lock entity's
+        async_added_to_hass re-reads CONF_LOCK_AUTOMATIONS. Without the reload,
+        the auto-lock listener keeps its stale empty circuit lists from the
+        original load and never fires.
+        """
+        from custom_components.securitas.const import CONF_LOCK_AUTOMATIONS
+
+        data = make_config_entry_data()
+        # All non-lock options match data so the existing trigger keys don't
+        # spuriously cause a reload — isolating CONF_LOCK_AUTOMATIONS as the
+        # only differing setting.
+        options = {
+            CONF_CODE: data[CONF_CODE],
+            CONF_CODE_ARM_REQUIRED: data[CONF_CODE_ARM_REQUIRED],
+            CONF_SCAN_INTERVAL: data[CONF_SCAN_INTERVAL],
+            CONF_MAP_HOME: data[CONF_MAP_HOME],
+            CONF_MAP_AWAY: data[CONF_MAP_AWAY],
+            CONF_MAP_NIGHT: data[CONF_MAP_NIGHT],
+            **{k: data[k] for k in (CONF_MAP_CUSTOM, CONF_MAP_VACATION) if k in data},
+            CONF_NOTIFY_GROUP: "",
+            CONF_FORCE_ARM_NOTIFICATIONS: data[CONF_FORCE_ARM_NOTIFICATIONS],
+            CONF_LOCK_AUTOMATIONS: {
+                "01": {"lock_on_arm": ["interior"], "unlock_disarms": ["interior"]}
+            },
+        }
+        entry = MockConfigEntry(domain=DOMAIN, data=data, options=options)
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_clearing_map_vacation_removes_stale_data_value(self, hass):
+        """Clearing CONF_MAP_VACATION via options must clear it from entry.data too.
+
+        Regression: the listener used to merge `{**entry.data, **entry.options}`,
+        which preserved the prior value in entry.data when the user cleared the
+        field. _opt() then resurrected the stale value, so the form pre-filled
+        again on the next open — the field appeared "stuck".
+        """
+        data = make_config_entry_data(
+            has_peri=True,
+            map_vacation="partial_night_peri",
+        )
+        # User just saved new options that omit CONF_MAP_VACATION (cleared).
+        options = {
+            CONF_CODE: data[CONF_CODE],
+            CONF_CODE_ARM_REQUIRED: data[CONF_CODE_ARM_REQUIRED],
+            CONF_SCAN_INTERVAL: data[CONF_SCAN_INTERVAL],
+            CONF_MAP_HOME: data[CONF_MAP_HOME],
+            CONF_MAP_AWAY: data[CONF_MAP_AWAY],
+            CONF_MAP_NIGHT: data[CONF_MAP_NIGHT],
+            CONF_MAP_CUSTOM: data[CONF_MAP_CUSTOM],
+            # CONF_MAP_VACATION intentionally absent — user cleared the field.
+            CONF_NOTIFY_GROUP: data[CONF_NOTIFY_GROUP],
+            CONF_FORCE_ARM_NOTIFICATIONS: data[CONF_FORCE_ARM_NOTIFICATIONS],
+        }
+        entry = MockConfigEntry(domain=DOMAIN, data=data, options=options)
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ):
+            await async_update_options(hass, entry)
+
+        assert CONF_MAP_VACATION not in entry.data, (
+            f"Stale CONF_MAP_VACATION should be cleared from entry.data, "
+            f"got {entry.data.get(CONF_MAP_VACATION)!r}"
+        )
+
+    async def test_clearing_map_vacation_with_empty_string_clears_data(self, hass):
+        """An empty-string vacation in options (UI 'Not used' selection) must
+        propagate to entry.data, not leave a stale prior value behind."""
+        data = make_config_entry_data(
+            has_peri=True,
+            map_vacation="partial_night_peri",
+        )
+        options = {
+            CONF_CODE: data[CONF_CODE],
+            CONF_CODE_ARM_REQUIRED: data[CONF_CODE_ARM_REQUIRED],
+            CONF_SCAN_INTERVAL: data[CONF_SCAN_INTERVAL],
+            CONF_MAP_HOME: data[CONF_MAP_HOME],
+            CONF_MAP_AWAY: data[CONF_MAP_AWAY],
+            CONF_MAP_NIGHT: data[CONF_MAP_NIGHT],
+            CONF_MAP_CUSTOM: data[CONF_MAP_CUSTOM],
+            CONF_MAP_VACATION: "",
+            CONF_NOTIFY_GROUP: data[CONF_NOTIFY_GROUP],
+            CONF_FORCE_ARM_NOTIFICATIONS: data[CONF_FORCE_ARM_NOTIFICATIONS],
+        }
+        entry = MockConfigEntry(domain=DOMAIN, data=data, options=options)
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ):
+            await async_update_options(hass, entry)
+
+        assert not entry.data.get(CONF_MAP_VACATION), (
+            f"Cleared vacation should resolve to falsy in entry.data, "
+            f"got {entry.data.get(CONF_MAP_VACATION)!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "toggle_key",
+        [
+            "enable_interior_panel",
+            "enable_perimeter_panel",
+            "enable_annex_panel",
+        ],
+    )
+    async def test_reload_when_subpanel_toggle_changes(self, hass, toggle_key):
+        """Toggling any sub-panel option triggers a config-entry reload."""
+        data = make_config_entry_data()
+        data[toggle_key] = False
+        options = {
+            CONF_CODE: data[CONF_CODE],
+            CONF_CODE_ARM_REQUIRED: data[CONF_CODE_ARM_REQUIRED],
+            CONF_SCAN_INTERVAL: data[CONF_SCAN_INTERVAL],
+            CONF_MAP_HOME: data[CONF_MAP_HOME],
+            CONF_MAP_AWAY: data[CONF_MAP_AWAY],
+            CONF_MAP_NIGHT: data[CONF_MAP_NIGHT],
+            **{k: data[k] for k in (CONF_MAP_CUSTOM, CONF_MAP_VACATION) if k in data},
+            CONF_NOTIFY_GROUP: data[CONF_NOTIFY_GROUP],
+            CONF_FORCE_ARM_NOTIFICATIONS: data[CONF_FORCE_ARM_NOTIFICATIONS],
+            toggle_key: True,
+        }
+        entry = MockConfigEntry(domain=DOMAIN, data=data, options=options)
+        entry.add_to_hass(hass)
+
+        with patch.object(
+            hass.config_entries,
+            "async_reload",
+            new_callable=AsyncMock,
+        ) as mock_reload:
+            await async_update_options(hass, entry)
+            mock_reload.assert_awaited_once_with(entry.entry_id)
+
+
+# ===========================================================================
+# 7. TestAsyncUnloadEntry
+# ===========================================================================
+
+
+class TestAsyncUnloadEntry:
+    """Tests for async_unload_entry()."""
+
+    async def test_unload_success(self, hass):
+        """Unload should unload platforms and clean hass.data."""
+        hub = make_securitas_hub_mock()
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        # Set up a second entry to keep DOMAIN alive after unload
+        entry2 = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry2.add_to_hass(hass)
+        username = entry.data[CONF_USERNAME]
+
+        # Pre-populate hass.data as async_setup_entry would
+        hass.data[DOMAIN] = {
+            entry.entry_id: {"hub": hub, "devices": []},
+            entry2.entry_id: {"hub": hub, "devices": []},
+            "sessions": {username: {"hub": hub, "ref_count": 2}},
+        }
+
+        with patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_unload:
+            result = await async_unload_entry(hass, entry)
+
+        assert result is True
+        mock_unload.assert_awaited_once_with(entry, PLATFORMS)
+        # entry_id key should be removed
+        assert entry.entry_id not in hass.data[DOMAIN]
+        # DOMAIN should still be in hass.data because entry2 remains
+        assert DOMAIN in hass.data
+
+    async def test_unload_cancels_pending_lock_config_retries(self, hass):
+        """async_unload_entry cancels any pending lock-config retry timers."""
+        hub = make_securitas_hub_mock()
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+        username = entry.data[CONF_USERNAME]
+
+        unsub_a = MagicMock()
+        unsub_b = MagicMock()
+
+        hass.data[DOMAIN] = {
+            entry.entry_id: {
+                "hub": hub,
+                "devices": [],
+                "lock_config_retry_unsubs": [unsub_a, unsub_b],
+            },
+            "sessions": {username: {"hub": hub, "ref_count": 1}},
+        }
+
+        with patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            await async_unload_entry(hass, entry)
+
+        unsub_a.assert_called_once_with()
+        unsub_b.assert_called_once_with()
+
+    async def test_unload_removes_domain_when_empty(self, hass):
+        """When the last entry is unloaded, DOMAIN should be removed from hass.data."""
+        hub = make_securitas_hub_mock()
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        username = entry.data[CONF_USERNAME]
+        hass.data[DOMAIN] = {
+            entry.entry_id: {"hub": hub, "devices": []},
+            "sessions": {username: {"hub": hub, "ref_count": 1}},
+        }
+
+        with patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            await async_unload_entry(hass, entry)
+
+        assert DOMAIN not in hass.data
+
+
+# ===========================================================================
+# 8. TestSharedSession - Shared API session with reference counting
+# ===========================================================================
+
+
+class TestSharedSession:
+    """Tests for shared API session with reference counting."""
+
+    @pytest.fixture
+    def mock_hub(self):
+        """Create a mock VerisureHub for setup tests."""
+        hub = make_securitas_hub_mock()
+        hub.client.list_installations = AsyncMock(
+            return_value=[
+                make_installation(number="111", alias="Home"),
+                make_installation(number="222", alias="Office"),
+            ]
+        )
+        return hub
+
+    def _setup_context(self, mock_hub):
+        """Return a context manager stack for patching VerisureHub + dependencies."""
+        return (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+        )
+
+    async def test_first_entry_creates_session_with_ref_count_1(self, hass, mock_hub):
+        """First entry for a username should create a new session with ref_count=1."""
+        data = make_config_entry_data()
+        data[CONF_INSTALLATION] = "111"
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        mock_hub.login.assert_awaited_once()
+        username = data[CONF_USERNAME]
+        sessions = hass.data[DOMAIN]["sessions"]
+        assert username in sessions
+        assert sessions[username]["ref_count"] == 1
+        assert sessions[username]["hub"] is mock_hub
+
+    async def test_second_entry_reuses_session_ref_count_2(self, hass, mock_hub):
+        """Second entry for the same username should reuse the session, ref_count=2."""
+        data1 = make_config_entry_data()
+        data1[CONF_INSTALLATION] = "111"
+        entry1 = MockConfigEntry(domain=DOMAIN, data=data1)
+        entry1.add_to_hass(hass)
+
+        data2 = make_config_entry_data()
+        data2[CONF_INSTALLATION] = "222"
+        entry2 = MockConfigEntry(domain=DOMAIN, data=data2)
+        entry2.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result1 = await async_setup_entry(hass, entry1)
+            result2 = await async_setup_entry(hass, entry2)
+
+        assert result1 is True
+        assert result2 is True
+        # Login should only be called once (for the first entry)
+        mock_hub.login.assert_awaited_once()
+        username = data1[CONF_USERNAME]
+        sessions = hass.data[DOMAIN]["sessions"]
+        assert sessions[username]["ref_count"] == 2
+
+    async def test_per_entry_data_stored(self, hass, mock_hub):
+        """Each entry should have its own per-entry data with hub and devices."""
+        data1 = make_config_entry_data()
+        data1[CONF_INSTALLATION] = "111"
+        entry1 = MockConfigEntry(domain=DOMAIN, data=data1)
+        entry1.add_to_hass(hass)
+
+        data2 = make_config_entry_data()
+        data2[CONF_INSTALLATION] = "222"
+        entry2 = MockConfigEntry(domain=DOMAIN, data=data2)
+        entry2.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry1)
+            await async_setup_entry(hass, entry2)
+
+        # Each entry should have its own data
+        entry1_data = hass.data[DOMAIN][entry1.entry_id]
+        entry2_data = hass.data[DOMAIN][entry2.entry_id]
+
+        assert entry1_data["hub"] is mock_hub
+        assert entry2_data["hub"] is mock_hub
+        # Each entry should have only its own installation's device
+        assert len(entry1_data["devices"]) == 1
+        assert entry1_data["devices"][0].installation.number == "111"
+        assert len(entry2_data["devices"]) == 1
+        assert entry2_data["devices"][0].installation.number == "222"
+
+    async def test_concurrent_setup_shares_single_hub(self, hass, mock_hub):
+        """Concurrent async_setup_entry calls should share one hub, not create two."""
+        import asyncio
+
+        data1 = make_config_entry_data()
+        data1[CONF_INSTALLATION] = "111"
+        entry1 = MockConfigEntry(domain=DOMAIN, data=data1)
+        entry1.add_to_hass(hass)
+
+        data2 = make_config_entry_data()
+        data2[CONF_INSTALLATION] = "222"
+        entry2 = MockConfigEntry(domain=DOMAIN, data=data2)
+        entry2.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            # Run both setup calls concurrently, simulating HA restart
+            results = await asyncio.gather(
+                async_setup_entry(hass, entry1),
+                async_setup_entry(hass, entry2),
+            )
+
+        assert results == [True, True]
+        # Login should only be called once — the setup lock prevents the
+        # second entry from creating its own hub before the first finishes.
+        mock_hub.login.assert_awaited_once()
+        username = data1[CONF_USERNAME]
+        sessions = hass.data[DOMAIN]["sessions"]
+        assert sessions[username]["ref_count"] == 2
+        # Both entries should reference the same hub
+        assert hass.data[DOMAIN][entry1.entry_id]["hub"] is mock_hub
+        assert hass.data[DOMAIN][entry2.entry_id]["hub"] is mock_hub
+
+    async def test_unload_one_entry_decrements_ref_count(self, hass, mock_hub):
+        """Unloading one entry should decrement ref count but keep the session."""
+        data1 = make_config_entry_data()
+        data1[CONF_INSTALLATION] = "111"
+        entry1 = MockConfigEntry(domain=DOMAIN, data=data1)
+        entry1.add_to_hass(hass)
+
+        data2 = make_config_entry_data()
+        data2[CONF_INSTALLATION] = "222"
+        entry2 = MockConfigEntry(domain=DOMAIN, data=data2)
+        entry2.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry1)
+            await async_setup_entry(hass, entry2)
+
+        username = data1[CONF_USERNAME]
+        assert hass.data[DOMAIN]["sessions"][username]["ref_count"] == 2
+
+        # Unload entry1
+        with patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await async_unload_entry(hass, entry1)
+
+        assert result is True
+        # Session should still exist with ref_count=1
+        assert username in hass.data[DOMAIN]["sessions"]
+        assert hass.data[DOMAIN]["sessions"][username]["ref_count"] == 1
+        # entry1 data removed, entry2 data remains
+        assert entry1.entry_id not in hass.data[DOMAIN]
+        assert entry2.entry_id in hass.data[DOMAIN]
+
+    async def test_unload_last_entry_removes_session(self, hass, mock_hub):
+        """Unloading the last entry should remove the session entirely."""
+        data = make_config_entry_data()
+        data[CONF_INSTALLATION] = "111"
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        username = data[CONF_USERNAME]
+        assert hass.data[DOMAIN]["sessions"][username]["ref_count"] == 1
+
+        with patch.object(
+            hass.config_entries,
+            "async_unload_platforms",
+            new_callable=AsyncMock,
+            return_value=True,
+        ):
+            result = await async_unload_entry(hass, entry)
+
+        assert result is True
+        # Entire DOMAIN should be cleaned up
+        assert DOMAIN not in hass.data
+
+    async def test_per_entry_data_populated(self, hass, mock_hub):
+        """Per-entry data should contain hub and filtered devices."""
+        data = make_config_entry_data()
+        data[CONF_INSTALLATION] = "111"
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        # Per-entry data should be present
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        assert entry_data["hub"] is mock_hub
+        devices = entry_data["devices"]
+        assert len(devices) == 1
+        assert isinstance(devices[0], VerisureDevice)
+        # Old backward-compat keys should NOT be present
+        assert VerisureHub.__name__ not in hass.data[DOMAIN]
+
+    async def test_legacy_entry_without_installation_gets_all(self, hass, mock_hub):
+        """An entry without CONF_INSTALLATION should get all installations."""
+        data = make_config_entry_data()
+        # No CONF_INSTALLATION key — legacy behavior
+        entry = MockConfigEntry(domain=DOMAIN, data=data)
+        entry.add_to_hass(hass)
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry)
+
+        entry_data = hass.data[DOMAIN][entry.entry_id]
+        # Should get all installations (2 from mock_hub fixture)
+        assert len(entry_data["devices"]) == 2
+
+
+# ===========================================================================
+# Migration tests
+# ===========================================================================
+
+
+class TestAsyncMigrateEntry:
+    """Tests for async_migrate_entry — rejects all entries below v3."""
+
+    async def test_migration_v1_rejected(self, hass):
+        """v1 entry is rejected and notifies the user via translation key."""
+        data = make_config_entry_data(username="user@example.com")
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=data,
+            unique_id="user@example.com",
+            version=1,
+        )
+        entry.add_to_hass(hass)
+
+        with patch("custom_components.securitas._notify") as mock_notify:
+            result = await async_migrate_entry(hass, entry)
+
+        assert result is False
+        # Entry version remains unchanged
+        assert entry.version == 1
+        mock_notify.assert_called_once_with(
+            hass, "migration_required", "migration_required"
+        )
+
+    async def test_migration_v2_rejected(self, hass):
+        """v2 entry is rejected with return False (user must delete and re-add)."""
+        data = make_config_entry_data(username="user@example.com")
+        data[CONF_INSTALLATION] = "123456"
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=data,
+            unique_id="user@example.com_123456",
+            version=2,
+        )
+        entry.add_to_hass(hass)
+
+        with patch("custom_components.securitas._notify"):
+            result = await async_migrate_entry(hass, entry)
+
+        assert result is False
+        assert entry.version == 2
+
+    async def test_migration_v3_migrated_to_v4_strips_legacy_token(self, hass):
+        """v3 → v4 bumps the version and removes the obsolete CONF_TOKEN key.
+
+        CONF_PASSWORD is left in place: the next successful login will capture
+        a refresh token and the persist-callback strips the password then.
+        Doing it here would force a network login from inside async_migrate_entry,
+        which is fragile (offline boots, account-blocked, etc.).
+        """
+        from homeassistant.const import CONF_TOKEN
+
+        data = make_config_entry_data(username="user@example.com")
+        data[CONF_INSTALLATION] = "123456"
+        data[CONF_TOKEN] = "stale-jwt"  # legacy dead write from older versions
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=data,
+            unique_id="user@example.com_123456",
+            version=3,
+        )
+        entry.add_to_hass(hass)
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == 4
+        assert CONF_TOKEN not in entry.data
+        # CONF_PASSWORD intentionally retained — first setup login removes it.
+        assert CONF_PASSWORD in entry.data
+
+    async def test_migration_v4_accepted(self, hass):
+        """v4 entry passes through unchanged (current version)."""
+        data = make_config_entry_data(username="user@example.com")
+        data[CONF_INSTALLATION] = "123456"
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=data,
+            unique_id="user@example.com_123456",
+            version=4,
+        )
+        entry.add_to_hass(hass)
+
+        result = await async_migrate_entry(hass, entry)
+
+        assert result is True
+        assert entry.version == 4
+
+
+class TestPerDomainQueueSharing:
+    """Tests for per-domain ApiQueue sharing."""
+
+    async def test_same_country_shares_queue(self, hass):
+        """Two entries with same country should share one ApiQueue."""
+        data1 = make_config_entry_data(username="user1@test.com")
+        data2 = make_config_entry_data(username="user2@test.com")
+        entry1 = MockConfigEntry(domain=DOMAIN, data=data1)
+        entry2 = MockConfigEntry(domain=DOMAIN, data=data2)
+        entry1.add_to_hass(hass)
+        entry2.add_to_hass(hass)
+
+        mock_hub1 = make_securitas_hub_mock()
+        mock_hub1.client.list_installations = AsyncMock(
+            return_value=[make_installation()]
+        )
+        mock_hub2 = make_securitas_hub_mock()
+        mock_hub2.client.list_installations = AsyncMock(
+            return_value=[make_installation(number="654321")]
+        )
+
+        # Set up entry1
+        mock_cls1 = MagicMock(return_value=mock_hub1)
+        mock_cls1.__name__ = "VerisureHub"
+        with (
+            patch("custom_components.securitas.VerisureHub", mock_cls1),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry1)
+
+        # Set up entry2
+        mock_cls2 = MagicMock(return_value=mock_hub2)
+        mock_cls2.__name__ = "VerisureHub"
+        with (
+            patch("custom_components.securitas.VerisureHub", mock_cls2),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry2)
+
+        # Both hubs should have the same queue
+        hub1 = hass.data[DOMAIN][entry1.entry_id]["hub"]
+        hub2 = hass.data[DOMAIN][entry2.entry_id]["hub"]
+        assert hub1.api_queue is hub2.api_queue
+
+    async def test_different_country_gets_separate_queue(self, hass):
+        """Two entries with different countries should get separate queues."""
+        data_es = make_config_entry_data(username="user1@test.com", country="ES")
+        data_it = make_config_entry_data(username="user2@test.com", country="IT")
+        entry_es = MockConfigEntry(domain=DOMAIN, data=data_es)
+        entry_it = MockConfigEntry(domain=DOMAIN, data=data_it)
+        entry_es.add_to_hass(hass)
+        entry_it.add_to_hass(hass)
+
+        mock_hub_es = make_securitas_hub_mock()
+        mock_hub_es.client.list_installations = AsyncMock(
+            return_value=[make_installation()]
+        )
+        mock_hub_it = make_securitas_hub_mock()
+        mock_hub_it.client.list_installations = AsyncMock(
+            return_value=[make_installation(number="654321")]
+        )
+
+        # Set up ES entry
+        mock_cls_es = MagicMock(return_value=mock_hub_es)
+        mock_cls_es.__name__ = "VerisureHub"
+        with (
+            patch("custom_components.securitas.VerisureHub", mock_cls_es),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry_es)
+
+        # Set up IT entry
+        mock_cls_it = MagicMock(return_value=mock_hub_it)
+        mock_cls_it.__name__ = "VerisureHub"
+        with (
+            patch("custom_components.securitas.VerisureHub", mock_cls_it),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await async_setup_entry(hass, entry_it)
+
+        hub_es = hass.data[DOMAIN][entry_es.entry_id]["hub"]
+        hub_it = hass.data[DOMAIN][entry_it.entry_id]["hub"]
+        assert hub_es.api_queue is not hub_it.api_queue
+
+
+# ===========================================================================
+# _discover_cameras tests
+# ===========================================================================
+
+
+class TestDiscoverCameras:
+    """Tests for _discover_cameras() background discovery function."""
+
+    @pytest.mark.asyncio
+    async def test_empty_camera_list_adds_no_entities(self):
+        """When no cameras are found, camera_add_entities must not be called."""
+        from custom_components.securitas import _discover_cameras
+        from tests.conftest import make_installation
+
+        hass = MagicMock()
+        hub = MagicMock()
+        hub.get_camera_devices = AsyncMock(return_value=[])
+        camera_add = MagicMock()
+        button_add = MagicMock()
+        entry_data = {
+            "camera_add_entities": camera_add,
+            "button_add_entities": button_add,
+        }
+        entry = MagicMock()
+
+        await _discover_cameras(hass, hub, make_installation(), entry_data, entry)
+
+        camera_add.assert_not_called()
+        button_add.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exception_from_get_camera_devices_is_caught(self, caplog):
+        """An exception in get_camera_devices must not propagate — log warning and continue."""
+        import logging
+
+        from custom_components.securitas import _discover_cameras
+        from tests.conftest import make_installation
+
+        hass = MagicMock()
+        hub = MagicMock()
+        hub.get_camera_devices = AsyncMock(side_effect=Exception("network failure"))
+        camera_add = MagicMock()
+        button_add = MagicMock()
+        entry_data = {
+            "camera_add_entities": camera_add,
+            "button_add_entities": button_add,
+        }
+        entry = MagicMock()
+
+        with caplog.at_level(logging.WARNING, logger="custom_components.securitas"):
+            # Must not raise
+            await _discover_cameras(hass, hub, make_installation(), entry_data, entry)
+
+        assert "Failed to get camera devices" in caplog.text
+        camera_add.assert_not_called()
+        button_add.assert_not_called()
+
+
+# ===========================================================================
+# _async_discover_devices tests — ordering + completion signalling
+# ===========================================================================
+
+
+class TestAsyncDiscoverDevices:
+    """Tests for _async_discover_devices() ordering and event signalling."""
+
+    @pytest.mark.asyncio
+    async def test_locks_discovered_before_cameras(self):
+        """Locks must submit to the queue before cameras (options-flow latency).
+
+        Locks gate the Lock Automation options step; cameras don't. Order the
+        sequential awaits so a user opening options waits only on lock work.
+        """
+        import asyncio
+
+        from custom_components.securitas import _async_discover_devices
+        from custom_components.securitas.const import DOMAIN
+
+        hass = MagicMock()
+        hass.data = {DOMAIN: {}}
+
+        call_order: list[str] = []
+
+        async def fake_discover_cameras(*_args, **_kwargs):
+            call_order.append("cameras")
+
+        async def fake_discover_locks(*_args, **_kwargs):
+            call_order.append("locks")
+
+        entry = MagicMock()
+        entry.entry_id = "entry-1"
+        hass.data[DOMAIN][entry.entry_id] = {
+            "hub": MagicMock(),
+            "devices": [VerisureDevice(make_installation())],
+            "lock_discovery_complete": asyncio.Event(),
+        }
+
+        with (
+            patch(
+                "custom_components.securitas.discovery._discover_cameras",
+                new=fake_discover_cameras,
+            ),
+            patch(
+                "custom_components.securitas.discovery._discover_locks",
+                new=fake_discover_locks,
+            ),
+        ):
+            await _async_discover_devices(hass, entry)
+
+        assert call_order == ["locks", "cameras"], (
+            f"Expected locks before cameras, got {call_order}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lock_discovery_event_is_set_on_completion(self):
+        """The lock_discovery_complete event must be set once discovery returns."""
+        import asyncio
+
+        from custom_components.securitas import _async_discover_devices
+        from custom_components.securitas.const import DOMAIN
+
+        hass = MagicMock()
+        hass.data = {DOMAIN: {}}
+        event = asyncio.Event()
+        entry = MagicMock()
+        entry.entry_id = "entry-2"
+        hass.data[DOMAIN][entry.entry_id] = {
+            "hub": MagicMock(),
+            "devices": [VerisureDevice(make_installation())],
+            "lock_discovery_complete": event,
+        }
+
+        with (
+            patch(
+                "custom_components.securitas.discovery._discover_cameras",
+                new=AsyncMock(),
+            ),
+            patch(
+                "custom_components.securitas.discovery._discover_locks",
+                new=AsyncMock(),
+            ),
+        ):
+            await _async_discover_devices(hass, entry)
+
+        assert event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_lock_discovery_event_is_set_even_when_discovery_raises(self):
+        """The event must be set even if _discover_locks raises — never hang options."""
+        import asyncio
+
+        from custom_components.securitas import _async_discover_devices
+        from custom_components.securitas.const import DOMAIN
+
+        hass = MagicMock()
+        hass.data = {DOMAIN: {}}
+        event = asyncio.Event()
+        entry = MagicMock()
+        entry.entry_id = "entry-3"
+        hass.data[DOMAIN][entry.entry_id] = {
+            "hub": MagicMock(),
+            "devices": [VerisureDevice(make_installation())],
+            "lock_discovery_complete": event,
+        }
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("discovery exploded")
+
+        # Whether or not the function re-raises, the event must be set.
+        with (
+            patch(
+                "custom_components.securitas.discovery._discover_cameras",
+                new=AsyncMock(),
+            ),
+            patch(
+                "custom_components.securitas.discovery._discover_locks",
+                new=boom,
+            ),
+            contextlib.suppress(RuntimeError),
+        ):
+            await _async_discover_devices(hass, entry)
+
+        assert event.is_set()
+
+
+# ===========================================================================
+# Phase F3: Static-URL alias
+# ===========================================================================
+
+
+class TestStaticPathAliases:
+    """Verify that both /verisure-owa-panel and /securitas_panel are registered."""
+
+    @pytest.fixture
+    def mock_hub(self):
+        """Create a mock VerisureHub for setup tests."""
+        from tests.conftest import make_installation, make_securitas_hub_mock
+
+        hub = make_securitas_hub_mock()
+        hub.client.list_installations = AsyncMock(return_value=[make_installation()])
+        return hub
+
+    async def test_static_paths_register_both_new_and_legacy(self, hass, mock_hub):
+        """Setup should register both /verisure-owa-panel and /securitas_panel."""
+        entry = MockConfigEntry(domain=DOMAIN, data=make_config_entry_data())
+        entry.add_to_hass(hass)
+
+        hass.http = MagicMock()
+        hass.http.async_register_static_paths = AsyncMock()
+
+        with (
+            _patch_hub(mock_hub),
+            patch("custom_components.securitas.async_get_clientsession"),
+            patch.object(
+                hass.config_entries,
+                "async_forward_entry_setups",
+                new_callable=AsyncMock,
+            ),
+            patch("custom_components.securitas.frontend.add_extra_js_url"),
+        ):
+            result = await async_setup_entry(hass, entry)
+
+        assert result is True
+        hass.http.async_register_static_paths.assert_awaited_once()
+        call_args = hass.http.async_register_static_paths.call_args[0][0]
+        paths = [cfg.url_path for cfg in call_args]
+        assert "/verisure-owa-panel" in paths
+        assert "/securitas_panel" in paths
+
+
+# ===========================================================================
+# TestServiceDescriptionTargets
+# ===========================================================================
+
+
+class TestServiceDescriptionTargets:
+    """Regression guard: service ``target`` entity filters must be lists.
+
+    These descriptions reach HA via ``async_set_service_schema``, which copies
+    ``target`` through *unchanged* — unlike ``services.yaml``, which is
+    validated by ``TargetSelector.CONFIG_SCHEMA`` and normalised with
+    ``cv.ensure_list``. HA's automation-editor lookup
+    (``_get_automation_component_domains``) iterates ``target["entity"]``
+    expecting a list of ``{integration, domain}`` mappings; a bare mapping
+    iterates to its *string keys* and raises ``AttributeError``, which aborts
+    the shared cross-integration lookup and breaks the action/target picker for
+    *every* integration while this one is loaded (PR #525).
+    """
+
+    def test_target_entity_filters_are_lists(self):
+        """Every service ``target["entity"]`` must be a list of mapping filters."""
+        from custom_components.securitas import (
+            _ALIASED_SERVICES,
+            _V5_ENTITY_SERVICES,
+        )
+
+        schemas = [(name, schema) for name, _sr, schema in _ALIASED_SERVICES]
+        schemas += [
+            (spec["service_name"], spec["schema"])
+            for spec in _V5_ENTITY_SERVICES
+            if spec.get("schema")
+        ]
+        targets = [
+            (name, schema["target"]["entity"])
+            for name, schema in schemas
+            if schema.get("target", {}).get("entity") is not None
+        ]
+
+        # Guard against a vacuous pass if the specs move or lose their targets.
+        assert targets, "no service target entity filters found — did the specs move?"
+
+        for service_name, entity in targets:
+            assert isinstance(entity, list), (
+                f"{service_name}: target['entity'] must be a list of mapping "
+                f"filters (async_set_service_schema does not run cv.ensure_list), "
+                f"got {type(entity).__name__}"
+            )
+            assert entity and all(isinstance(item, dict) for item in entity), (
+                f"{service_name}: target['entity'] must be a non-empty list of "
+                "mapping filters"
+            )
+            # HA's entity-filter schema normalises `domain` with cv.ensure_list
+            # (helpers/selector.py) — but only on the validated services.yaml
+            # path. async_set_service_schema skips that, so a bare-string domain
+            # reaches _AutomationComponentLookupData.create unchanged, where
+            # `set(config.get("domain", []))` turns "alarm_control_panel" into a
+            # set of single characters and the filter then matches no entity.
+            for filt in entity:
+                if "domain" in filt:
+                    domain = filt["domain"]
+                    assert isinstance(domain, list) and all(
+                        isinstance(d, str) for d in domain
+                    ), (
+                        f"{service_name}: entity filter 'domain' must be a list "
+                        f"of strings so it survives async_set_service_schema's "
+                        f"unvalidated copy; got {domain!r}"
+                    )

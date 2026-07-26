@@ -1,0 +1,286 @@
+"""Tests for the Verisure OWA exception hierarchy."""
+
+from __future__ import annotations
+
+import pytest
+
+from custom_components.securitas.verisure_owa_api.exceptions import (
+    AccountBlockedError,
+    APIConnectionError,
+    APIResponseError,
+    ArmingExceptionError,
+    AuthenticationError,
+    ImageCaptureError,
+    OperationFailedError,
+    OperationTimeoutError,
+    SessionExpiredError,
+    TwoFactorRequiredError,
+    UnexpectedStateError,
+    VerisureOwaError,
+    WAFBlockedError,
+    _error_code_from_body,
+    is_genuine_auth_failure,
+)
+
+# ── Subclass checks ───────────────────────────────────────────────────────────
+
+
+class TestSubclassRelationships:
+    """Every exception type must derive from VerisureOwaError."""
+
+    @pytest.mark.parametrize(
+        "exc_class",
+        [
+            AuthenticationError,
+            TwoFactorRequiredError,
+            SessionExpiredError,
+            APIResponseError,
+            WAFBlockedError,
+            APIConnectionError,
+            OperationTimeoutError,
+            OperationFailedError,
+            ArmingExceptionError,
+            ImageCaptureError,
+            UnexpectedStateError,
+        ],
+    )
+    def test_is_subclass_of_base(self, exc_class):
+        assert issubclass(exc_class, VerisureOwaError)
+
+    def test_base_is_exception(self):
+        assert issubclass(VerisureOwaError, Exception)
+
+
+# ── Basic construction & message ─────────────────────────────────────────────
+
+
+class TestBasicConstruction:
+    def test_verisure_owa_error_message(self):
+        err = VerisureOwaError("something went wrong")
+        assert err.message == "something went wrong"
+
+    def test_authentication_error(self):
+        err = AuthenticationError("bad credentials")
+        assert err.message == "bad credentials"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_two_factor_required_error(self):
+        err = TwoFactorRequiredError("2FA required")
+        assert err.message == "2FA required"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_session_expired_error(self):
+        err = SessionExpiredError("JWT expired")
+        assert err.message == "JWT expired"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_waf_blocked_error(self):
+        err = WAFBlockedError("WAF block")
+        assert err.message == "WAF block"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_api_connection_error(self):
+        err = APIConnectionError("network failure")
+        assert err.message == "network failure"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_operation_timeout_error(self):
+        err = OperationTimeoutError("timed out")
+        assert err.message == "timed out"
+        assert isinstance(err, VerisureOwaError)
+
+    def test_image_capture_error(self):
+        err = ImageCaptureError("capture failed")
+        assert err.message == "capture failed"
+        assert isinstance(err, VerisureOwaError)
+
+
+# ── Typed-field exceptions ────────────────────────────────────────────────────
+
+
+class TestAPIResponseError:
+    def test_no_http_status(self):
+        err = APIResponseError("GraphQL error")
+        assert err.message == "GraphQL error"
+        assert err.http_status is None
+
+    def test_with_http_status(self):
+        err = APIResponseError("Forbidden", http_status=403)
+        assert err.http_status == 403
+        assert err.message == "Forbidden"
+
+    def test_is_subclass(self):
+        assert issubclass(APIResponseError, VerisureOwaError)
+
+
+class TestOperationFailedError:
+    def test_defaults(self):
+        err = OperationFailedError("panel rejected")
+        assert err.message == "panel rejected"
+        assert err.error_code is None
+        assert err.error_type is None
+
+    def test_with_codes(self):
+        err = OperationFailedError("rejected", error_code="E01", error_type="LOCK")
+        assert err.error_code == "E01"
+        assert err.error_type == "LOCK"
+        assert err.message == "rejected"
+
+    def test_is_subclass(self):
+        assert issubclass(OperationFailedError, VerisureOwaError)
+
+
+class TestArmingExceptionError:
+    def _make(self, aliases: list[str]) -> ArmingExceptionError:
+        exceptions = [{"alias": a, "status": "OPEN"} for a in aliases]
+        return ArmingExceptionError("ref-1", "suid-42", exceptions)
+
+    def test_carries_reference_id(self):
+        err = self._make(["Kitchen window"])
+        assert err.reference_id == "ref-1"
+
+    def test_carries_suid(self):
+        err = self._make(["Kitchen window"])
+        assert err.suid == "suid-42"
+
+    def test_carries_exceptions_list(self):
+        err = self._make(["Kitchen window", "Garage door"])
+        assert len(err.exceptions) == 2
+
+    def test_message_includes_alias(self):
+        err = self._make(["Kitchen window"])
+        assert "Kitchen window" in err.message
+
+    def test_message_includes_multiple_aliases(self):
+        err = self._make(["Zone A", "Zone B"])
+        assert "Zone A" in err.message
+        assert "Zone B" in err.message
+
+    def test_missing_alias_falls_back_to_unknown(self):
+        err = ArmingExceptionError("ref-1", "suid-42", [{"status": "OPEN"}])
+        assert "unknown" in err.message
+
+    def test_empty_exceptions(self):
+        err = ArmingExceptionError("ref-1", "suid-42", [])
+        assert "Arming blocked by exceptions:" in err.message
+
+    def test_is_subclass(self):
+        assert issubclass(ArmingExceptionError, VerisureOwaError)
+
+
+class TestUnexpectedStateError:
+    def test_carries_proto_code(self):
+        err = UnexpectedStateError("XYZ")
+        assert err.proto_code == "XYZ"
+
+    def test_message_includes_proto_code(self):
+        err = UnexpectedStateError("XYZ")
+        assert "XYZ" in err.message
+
+    def test_is_subclass(self):
+        assert issubclass(UnexpectedStateError, VerisureOwaError)
+
+
+# ── log_detail() behaviour ────────────────────────────────────────────────────
+
+
+class TestLogDetail:
+    """log_detail() returns brief output for known statuses, verbose otherwise."""
+
+    KNOWN_STATUSES = [400, 403, 404, 409]
+    UNKNOWN_STATUSES = [500, 502, 429, None]
+
+    @pytest.mark.parametrize("status", KNOWN_STATUSES)
+    def test_known_status_returns_message_only(self, status):
+        err = APIResponseError("known error", http_status=status)
+        err.response_body = {"errors": ["something"]}
+        assert err.log_detail() == "known error"
+
+    @pytest.mark.parametrize("status", UNKNOWN_STATUSES)
+    def test_unknown_status_with_body_includes_body(self, status):
+        err = APIResponseError("unknown error", http_status=status)
+        err.response_body = {"errors": ["oops"]}
+        detail = err.log_detail()
+        assert "unknown error" in detail
+        assert "oops" in detail
+
+    def test_unknown_status_without_body_returns_message(self):
+        err = VerisureOwaError("bare error", http_status=500)
+        assert err.log_detail() == "bare error"
+
+    def test_no_status_no_body_returns_message(self):
+        err = VerisureOwaError("bare error")
+        assert err.log_detail() == "bare error"
+
+    def test_response_body_set_after_construction(self):
+        err = VerisureOwaError("late body", http_status=500)
+        assert err.log_detail() == "late body"
+        err.response_body = {"raw": "data"}
+        assert "raw" in err.log_detail()
+
+
+# ── is_genuine_auth_failure ───────────────────────────────────────────────────
+
+
+def _with_err_code(err: VerisureOwaError, code: str) -> VerisureOwaError:
+    err.response_body = {"errors": [{"message": "x", "data": {"err": code}}]}
+    return err
+
+
+class TestIsGenuineAuthFailure:
+    def test_authentication_error_is_genuine(self):
+        assert is_genuine_auth_failure(AuthenticationError("bad creds")) is True
+
+    def test_account_blocked_is_genuine(self):
+        assert is_genuine_auth_failure(AccountBlockedError("blocked")) is True
+
+    def test_two_factor_required_is_genuine(self):
+        assert is_genuine_auth_failure(TwoFactorRequiredError("2fa")) is True
+
+    def test_err_60052_account_blocked_code_is_genuine(self):
+        err = _with_err_code(VerisureOwaError("blocked"), "60052")
+        assert is_genuine_auth_failure(err) is True
+
+    def test_err_60067_invalid_session_code_is_genuine(self):
+        err = _with_err_code(
+            SessionExpiredError("Invalid Session", http_status=403), "60067"
+        )
+        assert is_genuine_auth_failure(err) is True
+
+    def test_bare_403_session_expired_is_transient(self):
+        err = SessionExpiredError(
+            "Invalid session. Please, try again later.", http_status=403
+        )
+        assert is_genuine_auth_failure(err) is False
+
+    def test_500_server_error_is_transient(self):
+        assert (
+            is_genuine_auth_failure(VerisureOwaError("boom", http_status=500)) is False
+        )
+
+    def test_waf_block_is_transient(self):
+        assert is_genuine_auth_failure(WAFBlockedError("blocked")) is False
+
+    def test_js_crash_null_data_is_transient(self):
+        err = VerisureOwaError("Cannot read properties of undefined (reading 'it')")
+        err.response_body = {
+            "errors": [
+                {"message": "Cannot read properties of undefined (reading 'it')"}
+            ],
+            "data": {"xSRefreshLogin": None},
+        }
+        assert is_genuine_auth_failure(err) is False
+
+    def test_unknown_error_defaults_to_transient(self):
+        assert is_genuine_auth_failure(VerisureOwaError("mystery")) is False
+
+
+# ── _error_code_from_body ─────────────────────────────────────────────────────
+
+
+def test_error_code_from_body_extracts_and_stringifies():
+    assert _error_code_from_body({"errors": [{"data": {"err": "60052"}}]}) == "60052"
+    assert _error_code_from_body({"errors": [{"data": {"err": 60052}}]}) == "60052"
+    assert _error_code_from_body({"errors": []}) is None
+    assert _error_code_from_body("nope") is None
+    assert _error_code_from_body({"errors": [{"message": "x"}]}) is None

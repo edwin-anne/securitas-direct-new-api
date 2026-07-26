@@ -1,0 +1,301 @@
+"""Tests for VerisureOwaClient helper methods."""
+
+from datetime import datetime
+from unittest.mock import AsyncMock
+
+import jwt
+import pytest
+
+from custom_components.securitas.verisure_owa_api.exceptions import (
+    VerisureOwaError,
+)
+
+from .conftest import make_jwt
+
+# ── _decode_auth_token() ────────────────────────────────────────────────────
+
+
+class TestDecodeAuthToken:
+    def test_decodes_valid_jwt_and_sets_expiry(self, api):
+        """Valid JWT should return decoded dict and set authentication_token_exp."""
+        token = make_jwt(exp_minutes=30)
+        result = api._decode_auth_token(token)
+
+        assert result is not None
+        assert "exp" in result
+        assert isinstance(api.authentication_token_exp, datetime)
+        assert api.authentication_token_exp > datetime.now()
+
+    def test_returns_none_on_invalid_token(self, api):
+        """Invalid JWT string should return None and not crash."""
+        result = api._decode_auth_token("not-a-valid-jwt")
+        assert result is None
+
+    def test_handles_jwt_without_exp_claim(self, api):
+        """JWT without 'exp' claim should return decoded dict but not update expiry."""
+        token = jwt.encode({"sub": "test"}, "secret", algorithm="HS256")
+        old_exp = api.authentication_token_exp
+        result = api._decode_auth_token(token)
+
+        assert result is not None
+        assert "sub" in result
+        assert api.authentication_token_exp == old_exp
+
+    def test_returns_none_on_none_input(self, api):
+        """None input should return None gracefully."""
+        result = api._decode_auth_token(None)
+        assert result is None
+
+
+# ── _extract_response_data() ────────────────────────────────────────────────
+
+
+class TestExtractResponseData:
+    def test_extracts_nested_data(self, api):
+        """Should return response['data'][field_name] when present."""
+        response = {"data": {"xSFoo": {"res": "OK", "msg": ""}}}
+        result = api._extract_response_data(response, "xSFoo")
+        assert result == {"res": "OK", "msg": ""}
+
+    def test_raises_when_data_key_missing(self, api):
+        """Should raise VerisureOwaError when 'data' key is absent."""
+        response = {"errors": [{"message": "bad"}]}
+        with pytest.raises(VerisureOwaError, match="xSFoo"):
+            api._extract_response_data(response, "xSFoo")
+
+    def test_raises_when_data_is_none(self, api):
+        """Should raise VerisureOwaError when response['data'] is None."""
+        response = {"data": None}
+        with pytest.raises(VerisureOwaError, match="xSFoo"):
+            api._extract_response_data(response, "xSFoo")
+
+    def test_raises_when_field_is_none(self, api):
+        """Should raise VerisureOwaError when the named field is None."""
+        response = {"data": {"xSFoo": None}}
+        with pytest.raises(VerisureOwaError, match="xSFoo"):
+            api._extract_response_data(response, "xSFoo")
+
+    def test_raises_when_field_missing(self, api):
+        """Should raise VerisureOwaError when the named field doesn't exist."""
+        response = {"data": {"xSBar": {"res": "OK"}}}
+        with pytest.raises(VerisureOwaError, match="xSFoo"):
+            api._extract_response_data(response, "xSFoo")
+
+    def test_surfaces_graphql_error_message_and_code(self, api):
+        """When data.field is None but errors[] carries server-side context,
+        the raised exception must include that context (not just say
+        'response is None').  Regression: misleading logs were obscuring
+        Verisure's "Invalid Session / err=60067" reauth signal.
+        """
+        response = {
+            "errors": [
+                {
+                    "message": "Invalid Session",
+                    "name": "ApiError",
+                    "data": {"res": "ERROR", "err": "60067"},
+                    "path": ["xSRefreshLogin"],
+                }
+            ],
+            "data": {"xSRefreshLogin": None},
+        }
+        with pytest.raises(VerisureOwaError) as excinfo:
+            api._extract_response_data(response, "xSRefreshLogin")
+        msg = str(excinfo.value)
+        assert "Invalid Session" in msg
+        assert "60067" in msg
+        assert "xSRefreshLogin" in msg
+
+    def test_surfaces_graphql_error_when_data_key_missing(self, api):
+        """Same surfacing for the response-has-no-data branch."""
+        response = {
+            "errors": [
+                {"message": "Bad Request", "data": {"err": "12345"}},
+            ]
+        }
+        with pytest.raises(VerisureOwaError) as excinfo:
+            api._extract_response_data(response, "xSFoo")
+        msg = str(excinfo.value)
+        assert "Bad Request" in msg
+        assert "12345" in msg
+
+
+# ── _poll_operation() ────────────────────────────────────────────────────────
+
+
+class TestPollOperation:
+    async def test_returns_result_on_first_non_wait(self, api):
+        """Should return immediately when check_fn returns non-WAIT result."""
+        check_fn = AsyncMock(return_value={"res": "OK", "msg": "done"})
+        api.poll_delay = 0
+
+        result = await api._poll_operation(check_fn)
+        assert result == {"res": "OK", "msg": "done"}
+        assert check_fn.call_count == 1
+
+    async def test_polls_until_non_wait(self, api):
+        """Should keep polling while result is WAIT, then return final result."""
+        check_fn = AsyncMock(
+            side_effect=[
+                {"res": "WAIT", "msg": ""},
+                {"res": "WAIT", "msg": ""},
+                {"res": "OK", "msg": "done"},
+            ]
+        )
+        api.poll_delay = 0
+
+        result = await api._poll_operation(check_fn)
+        assert result["res"] == "OK"
+        assert check_fn.call_count == 3
+
+    async def test_retries_on_transient_timeout_error(self, api):
+        """Should catch asyncio.TimeoutError and continue polling."""
+        check_fn = AsyncMock(
+            side_effect=[
+                TimeoutError("connection timeout"),
+                {"res": "OK", "msg": "done"},
+            ]
+        )
+        api.poll_delay = 0
+
+        result = await api._poll_operation(check_fn)
+        assert result["res"] == "OK"
+        assert check_fn.call_count == 2
+
+    async def test_raises_on_non_transient_error(self, api):
+        """Should immediately raise non-transient errors (no http_status)."""
+        check_fn = AsyncMock(side_effect=VerisureOwaError("bad request"))
+        api.poll_delay = 0
+
+        with pytest.raises(VerisureOwaError, match="bad request"):
+            await api._poll_operation(check_fn)
+
+    async def test_retries_on_409_conflict(self, api):
+        """Should retry on VerisureOwaError with http_status=409 (server busy)."""
+        err_409 = VerisureOwaError("alarm-manager.alarm_process_error", http_status=409)
+        check_fn = AsyncMock(
+            side_effect=[
+                err_409,
+                {"res": "OK", "msg": "done"},
+            ]
+        )
+        api.poll_delay = 0
+
+        result = await api._poll_operation(check_fn)
+        assert result["res"] == "OK"
+        assert check_fn.call_count == 2
+
+    async def test_raises_on_non_409_verisure_owa_error(self, api):
+        """Should immediately raise VerisureOwaError with non-409 http_status."""
+        err_500 = VerisureOwaError("server error", http_status=500)
+        check_fn = AsyncMock(side_effect=err_500)
+        api.poll_delay = 0
+
+        with pytest.raises(VerisureOwaError, match="server error"):
+            await api._poll_operation(check_fn)
+
+    async def test_timeout_raises(self, api):
+        """Should raise OperationTimeoutError when wall-clock timeout is exceeded."""
+        from custom_components.securitas.verisure_owa_api.exceptions import (
+            OperationTimeoutError,
+        )
+
+        check_fn = AsyncMock(return_value={"res": "WAIT", "msg": ""})
+        api.poll_delay = 0
+
+        with pytest.raises(OperationTimeoutError, match="timed out"):
+            await api._poll_operation(check_fn, timeout=0.05)
+
+    async def test_also_polls_on_specific_message(self, api):
+        """Should continue polling when continue_on_msg matches response msg."""
+        check_fn = AsyncMock(
+            side_effect=[
+                {"res": "ERROR", "msg": "alarm-manager.error_no_response_to_request"},
+                {"res": "OK", "msg": "done"},
+            ]
+        )
+        api.poll_delay = 0
+
+        result = await api._poll_operation(
+            check_fn,
+            continue_on_msg="alarm-manager.error_no_response_to_request",
+        )
+        assert result["res"] == "OK"
+        assert check_fn.call_count == 2
+
+
+# ── _check_authentication_token() error handling ────────────────────────────
+
+
+class TestCheckAuthenticationTokenErrorHandling:
+    async def test_transient_refresh_error_propagates_no_login(self, api):
+        """A transient refresh error (bare VerisureOwaError) propagates instead
+        of falling back to login(), and is recorded for visibility."""
+        api.authentication_token = None
+        api.refresh_token_value = "some-refresh-token"
+        api.refresh_token = AsyncMock(side_effect=VerisureOwaError("refresh failed"))
+        api.login = AsyncMock()
+
+        with pytest.raises(VerisureOwaError):
+            await api._check_authentication_token()
+
+        api.login.assert_not_called()
+        assert api.consecutive_auth_recovery_failures == 1
+
+    async def test_timeout_refresh_error_propagates_no_login(self, api):
+        """A raw asyncio.TimeoutError during refresh is wrapped as a
+        VerisureOwaError and propagated (transient), not funneled into login."""
+        api.authentication_token = None
+        api.refresh_token_value = "some-refresh-token"
+        api.refresh_token = AsyncMock(side_effect=TimeoutError())
+        api.login = AsyncMock()
+
+        with pytest.raises(VerisureOwaError):
+            await api._check_authentication_token()
+
+        api.login.assert_not_called()
+        assert api.consecutive_auth_recovery_failures == 1
+
+    async def test_does_not_catch_unexpected_exceptions(self, api):
+        """Should NOT catch unexpected exceptions like ValueError."""
+        api.authentication_token = None
+        api.refresh_token_value = "some-refresh-token"
+        api.refresh_token = AsyncMock(side_effect=ValueError("unexpected"))
+        api.login = AsyncMock()
+
+        with pytest.raises(ValueError, match="unexpected"):
+            await api._check_authentication_token()
+
+
+# ── logout() token cleanup ──────────────────────────────────────────────────
+
+
+class TestLogoutTokenCleanup:
+    async def test_clears_tokens_on_successful_logout(self, api, mock_execute):
+        """Logout should clear all stored tokens."""
+        api.authentication_token = "some-token"
+        api.refresh_token_value = "some-refresh"
+        api.authentication_token_exp = datetime.now()
+        api.login_timestamp = 12345
+
+        mock_execute.return_value = {"data": {"xSLogout": True}}
+        await api.logout()
+
+        assert api.authentication_token is None
+        assert api.refresh_token_value == ""
+        assert api.authentication_token_exp == datetime.min
+        assert api.login_timestamp == 0
+
+    async def test_clears_tokens_even_on_failed_logout(self, api, mock_execute):
+        """Tokens should be cleared even if the logout API call fails."""
+        api.authentication_token = "some-token"
+        api.refresh_token_value = "some-refresh"
+        api.authentication_token_exp = datetime.now()
+        api.login_timestamp = 12345
+
+        mock_execute.side_effect = VerisureOwaError("logout failed")
+
+        with pytest.raises(VerisureOwaError):
+            await api.logout()
+
+        assert api.authentication_token is None
+        assert api.refresh_token_value == ""

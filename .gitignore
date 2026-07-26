@@ -58,6 +58,7 @@ pip-log.txt
 
 # Unit test / coverage reports
 .coverage
+.coverage.*
 .tox
 coverage.xml
 nosetests.xml
@@ -89,6 +90,7 @@ venv
 Pipfile*
 share/*
 /Scripts/
+uv.lock
 
 # vimmy stuff
 *.swp
@@ -132,3 +134,21 @@ tmp_cache
 
 # python-language-server / Rope
 .ropeproject
+.worktrees/
+docs/handoffs/
+docs/plans/
+docs/superpowers/
+
+# Raw HAR captures (contain auth tokens — only sanitised fixtures committed)
+tests/fixtures/*-events.json
+tests/fixtures/*.har
+
+# Local pyright config (user-specific venv path)
+pyrightconfig.json
+
+# JS test infrastructure
+node_modules/
+coverage/
+.vitest-cache/
+.ha-changes-state.json
+HA_CHANGES_REPORT.md
