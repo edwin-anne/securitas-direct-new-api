@@ -51,6 +51,15 @@ CONF_ADVANCED = "advanced"
 CONF_COUNTRY = "country"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_CODE_ARM_REQUIRED = "code_arm_required"
+# The alarm/lock PIN is persisted hashed (see pin_crypto.hash_pin), never as
+# plain text — CONF_CODE (homeassistant.const) is only used as the config-
+# flow/options-flow form field name for the raw user-entered value, which is
+# hashed before being written to entry.data/entry.options under these keys.
+CONF_CODE_HASH = "code_hash"
+# isdigit()-ness of the raw PIN, captured at hash time — needed for
+# code_format (NUMBER vs TEXT) since that can no longer be derived from the
+# (irreversible) hash itself.
+CONF_CODE_IS_NUMERIC = "code_is_numeric"
 CONF_DEVICE_INDIGITALL = "idDeviceIndigitall"
 CONF_ENTRY_ID = "entry_id"
 CONF_DELAY_CHECK_OPERATION = "delay_check_operation"
@@ -66,6 +75,15 @@ CONF_INSTALLATION = "installation"
 CONF_ENABLE_INTERIOR_PANEL = "enable_interior_panel"
 CONF_ENABLE_PERIMETER_PANEL = "enable_perimeter_panel"
 CONF_ENABLE_ANNEX_PANEL = "enable_annex_panel"
+# The sub-panel toggles, which are the *only* options-managed keys the config
+# flow seeds into entry.options when it creates the entry (everything else
+# starts life in entry.data). Lives here rather than in config_flow so
+# __init__ can read it without importing config_flow, which imports __init__.
+PANEL_OPTION_KEYS: tuple[str, ...] = (
+    CONF_ENABLE_PERIMETER_PANEL,
+    CONF_ENABLE_INTERIOR_PANEL,
+    CONF_ENABLE_ANNEX_PANEL,
+)
 # Opt-in to continuous background polling of the activity timeline. When off
 # (the default) the ActivityCoordinator runs on-demand only — the activity-log
 # card drives refreshes while it's on screen, so the integration makes no
@@ -110,6 +128,10 @@ SENTINEL_SERVICE_NAMES: frozenset[str] = frozenset({"CONFORT", "COMFORTO", "COMF
 # Lock automations (issue #449) — per-lock auto-lock-on-arm and
 # auto-disarm-on-unlock configuration.
 CONF_LOCK_AUTOMATIONS = "lock_automations"
+# Reuse the alarm's local PIN (CONF_CODE) to gate lock/unlock/open on smart
+# locks. No effect when CONF_CODE is empty.
+CONF_LOCK_CODE_REQUIRED = "lock_code_required"
+DEFAULT_LOCK_CODE_REQUIRED = False
 CIRCUIT_INTERIOR = "interior"
 CIRCUIT_PERIMETER = "perimeter"
 CIRCUIT_ANNEX = "annex"

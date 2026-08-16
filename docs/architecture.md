@@ -23,7 +23,8 @@ The integration has three layers:
 │  config_flow.py  (ConfigFlow + OptionsFlow + ReauthFlow)             │
 │  api_queue.py  (Priority-based rate limiting)                        │
 │  log_filter.py  (SensitiveDataFilter + TransientCoordinatorErrorFilter)│
-│  migrate.py  (v3→v4 + securitas→verisure_owa rebrand migration)      │
+│  pin_crypto.py  (hash_pin/verify_pin — PIN stored hashed, never plain)│
+│  migrate.py  (v3→v5 + securitas→verisure_owa rebrand migration)      │
 ├──────────────────────────────────────────────────────────────────────┤
 │  API Client Layer                                                    │
 │  verisure_owa_api/                                                   │
@@ -306,7 +307,7 @@ Serializes API calls with priority-based rate limiting to avoid WAF blocks. One 
 
 **Critical rule:** Platform `async_setup_entry` functions must **never** make API calls. All API-based discovery is deferred to a background task that runs after setup completes. This avoids blocking HA startup.
 
-**Config-entry migration (`async_migrate_entry`):** runs before `async_setup_entry` whenever `entry.version` is below the current `VERSION` (4). Pre-v3 entries are rejected with a user notification. v3 → v4 strips the obsolete `CONF_TOKEN` dead-write key and bumps the version. `CONF_PASSWORD` is intentionally preserved so the next successful login can still happen on legacy entries; it is scrubbed lazily by `VerisureHub._persist_refresh_token` on first capture.
+**Config-entry migration (`async_migrate_entry`):** runs before `async_setup_entry` whenever `entry.version` is below the current `VERSION` (5). Pre-v3 entries are rejected with a user notification. v3 → v4 strips the obsolete `CONF_TOKEN` dead-write key and bumps the version. `CONF_PASSWORD` is intentionally preserved so the next successful login can still happen on legacy entries; it is scrubbed lazily by `VerisureHub._persist_refresh_token` on first capture. v4 → v5 hashes any plain-text `CONF_CODE` still present in `entry.data`/`entry.options` (via `pin_crypto.hash_pin`) into `CONF_CODE_HASH` + `CONF_CODE_IS_NUMERIC`, then drops the plain-text key — see "PIN code validation" below. It rewrites the key wherever it was *present*, not just where it was non-empty: an empty `options["code"]` means "the user removed the PIN" and has to keep shadowing a stale `data["code"]` (`_opt` reads options first), so it becomes `CONF_CODE_HASH: None` rather than an absent key, which would stop shadowing and resurrect the old PIN.
 
 ```
 1. Read config entry data into OrderedDict (CONF_PASSWORD optional, CONF_REFRESH_TOKEN preferred)
@@ -357,7 +358,16 @@ Lock discovery uses the `LockCoordinator` created during setup. For locks whose 
 
 ### Options update (`async_update_options`)
 
-When the user changes options (PIN code, scan interval, alarm mappings, etc.), the listener merges the new options into the config entry data and reloads the integration. This triggers a full teardown and re-setup.
+When the user changes options (PIN code, scan interval, alarm mappings, etc.), the listener syncs the new options into the config entry data and reloads the integration. This triggers a full teardown and re-setup.
+
+The sync (`_synced_entry_data`) **replaces** the `_OPTIONS_MANAGED_FIELDS` in `entry.data` from `entry.options` rather than merging them, so a field the user cleared can't linger in data and get resurrected by `_opt()` (which reads options first, then data). Two things make that sound, and both matter if you touch this:
+
+1. **Clearing is recorded explicitly, so absence means "never written".** HA's frontend omits a cleared select from `user_input` entirely, so `_normalize_mapping_input` turns each cleared mapping back into an explicit `""`, and `_resolve_code_submission` always returns both PIN keys. **Exception:** the three `PANEL_OPTION_KEYS` toggles are only added to the schema when `_build_panel_extra_fields` sees the capability, and `_resolve_flow_capabilities` falls back to `(False, False)` until detection runs after a restart — so an options save in that window legitimately omits them. They are the one set for which "absent" is ambiguous.
+2. **The sync only runs once `entry.options` is authoritative** (`_options_are_authoritative`). `_create_entry_for_installation` seeds options with `PANEL_OPTION_KEYS` alone, leaving the PIN, mappings, scan interval and the rest in `entry.data`, so a non-empty options dict does *not* imply the options flow has run.
+
+Point 2 is not cosmetic. HA dispatches update listeners on **data-only** writes, and `VerisureHub._persist_refresh_token` writes `entry.data` on the first successful login — so treating a fresh install's toggles-only options dict as authoritative deleted the PIN hash and every mapping within minutes of setup, silently disabling the gate (`_check_code` accepts any code once `CONF_CODE_HASH` is gone). Note the two sets above coincide: the keys the config flow seeds are the keys the options flow may legitimately omit, both because the toggles are capability-gated rather than always present.
+
+Because this design *writes* `entry.data`, a wrong authoritative-ness answer is destructive and unrecoverable. Resolving options-vs-data at read time instead — leaving `entry.data` untouched — would turn that into a transient wrong read; worth considering if this machinery causes trouble again.
 
 ### VerisureDevice (`hub.py`)
 
@@ -479,10 +489,12 @@ The `_get_exceptions()` API call uses the same polling pattern as arm/disarm —
 - **Cleared** on successful arm/disarm operations and successful status polls
 - 403 on arm/disarm shows only the rate-limited notification (the generic "Error arming/disarming" notification is suppressed to avoid duplicates)
 
-**PIN code validation:**
-- `_check_code(code)` — Always checked for disarm. Raises `ServiceValidationError` if the code doesn't match the configured PIN. No PIN configured = any code accepted.
+**PIN code validation:** the PIN is never sent to the Verisure API — it only gates local HA actions — and is never stored in plain text. `entry.data`/`entry.options` carry `CONF_CODE_HASH` (a PBKDF2-HMAC-SHA256 hash, see `pin_crypto.py`) and `CONF_CODE_IS_NUMERIC` (captured at hash time, since digit-ness can't be recovered from the hash afterwards).
+- `_check_code(code)` — Always checked for disarm. Verifies `code` against `CONF_CODE_HASH` via `pin_crypto.verify_pin`; raises `ServiceValidationError` on mismatch. No PIN configured = any code accepted.
 - `_check_code_for_arm_if_required(code)` — Only checked for arm operations if `code_arm_required` is True AND a PIN is configured.
-- `code_format` — `None` if no PIN configured, `NUMBER` if the PIN is all digits, `TEXT` otherwise.
+- `code_format` — `None` if no PIN configured, `NUMBER` if `CONF_CODE_IS_NUMERIC` is True, `TEXT` otherwise.
+- `lock.py._check_code(code)` — the same PIN, same hash, gating lock/unlock/open when `CONF_LOCK_CODE_REQUIRED` is on. Publishing `code_format` is what turns the gate on, so it reads `CONF_CODE_HASH`/`CONF_CODE_IS_NUMERIC` too. Anything reading the PIN must go through `verify_pin` — there is no plain-text copy left to compare against.
+- Options-flow UX: the PIN field can't be pre-filled with the real value, so `config_flow._build_settings_schema` shows a fixed mask sentinel (`●●●●●●●●`) when a PIN is already configured. Resubmitting it unchanged keeps the existing hash; clearing the field removes the PIN; typing anything else hashes it as the new PIN (see `_resolve_code_submission`). The field is a password selector, so a newly typed PIN isn't left on screen in the clear.
 
 ### Event-driven force-arm architecture
 
@@ -1154,6 +1166,7 @@ alongside it under `.github/workflows/`.
 | `api_queue.py` | 125 | Priority-based rate-limited API queue (FOREGROUND/BACKGROUND) |
 | `const.py` | 58 | Integration constants, signal names, config keys, platform list, card URLs, `SENTINEL_SERVICE_NAMES` |
 | `log_filter.py` | 86 | `SensitiveDataFilter` -- log sanitization for secrets |
+| `pin_crypto.py` | 56 | `hash_pin`/`verify_pin` -- PBKDF2-HMAC-SHA256 hashing for the local alarm/lock PIN |
 | `verisure_owa_api/client.py` | 1764 | `VerisureOwaClient` -- auth lifecycle, typed GraphQL execution, all business operations |
 | `verisure_owa_api/http_transport.py` | 154 | `HttpTransport` -- raw HTTP POST with retries, WAF detection, JSON parsing |
 | `verisure_owa_api/graphql_queries.py` | 265 | GraphQL query and mutation string constants |

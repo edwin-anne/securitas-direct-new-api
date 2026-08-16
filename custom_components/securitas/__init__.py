@@ -16,7 +16,12 @@ import voluptuous as vol
 from homeassistant.components import (
     frontend,  # noqa: F401 — re-exported so tests can patch
 )
-from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.http import (
+    # HA 2026.8 moved StaticPathConfig to homeassistant.components.http.server,
+    # but it is still re-exported here at runtime and this path also works on
+    # our minimum supported HA (2025.2), where http.server does not yet exist.
+    StaticPathConfig,  # type: ignore[reportPrivateImportUsage]
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_CODE,
@@ -57,6 +62,8 @@ from .const import (  # noqa: F401 — re-exported for backwards compatibility
     CHIP_CARD_URL,
     CONF_ADVANCED,
     CONF_CODE_ARM_REQUIRED,
+    CONF_CODE_HASH,
+    CONF_CODE_IS_NUMERIC,
     CONF_COUNTRY,
     CONF_DELAY_CHECK_OPERATION,
     CONF_DEVICE_INDIGITALL,
@@ -68,6 +75,7 @@ from .const import (  # noqa: F401 — re-exported for backwards compatibility
     CONF_FORCE_ARM_NOTIFICATIONS,
     CONF_INSTALLATION,
     CONF_LOCK_AUTOMATIONS,
+    CONF_LOCK_CODE_REQUIRED,
     CONF_MAP_AWAY,
     CONF_MAP_CUSTOM,
     CONF_MAP_HOME,
@@ -84,9 +92,11 @@ from .const import (  # noqa: F401 — re-exported for backwards compatibility
     DEFAULT_DELAY_CHECK_OPERATION,
     DEFAULT_ENABLE_ACTIVITY_POLLING,
     DEFAULT_FORCE_ARM_NOTIFICATIONS,
+    DEFAULT_LOCK_CODE_REQUIRED,
     DEFAULT_OPERATION_POLL_TIMEOUT,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
+    PANEL_OPTION_KEYS,
     PLATFORMS,
     SENTINEL_SERVICE_NAMES,
     SIGNAL_CAMERA_STATE,
@@ -116,6 +126,7 @@ from .hub import (  # noqa: F401 — re-exported for backwards compatibility
 )
 from .log_filter import SensitiveDataFilter, TransientCoordinatorErrorFilter
 from .migrate_unique_ids import migrate_unique_ids
+from .pin_crypto import encode_pin
 from .verisure_owa_api import (
     ApiDomains,
     AuthenticationError,
@@ -128,6 +139,12 @@ from .verisure_owa_api import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Inert: this integration is config-entry only and ``async_setup`` ignores the
+# YAML config entirely. The schema exists so a legacy ``securitas:`` block from
+# the YAML era doesn't fail config validation at startup — hence ALLOW_EXTRA on
+# the domain schema, which lets keys we no longer declare pass through ignored.
+# Notably there is no PIN field: the PIN is only ever set through the config
+# flow, and is stored hashed (see pin_crypto), so YAML must not invite one.
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
@@ -135,12 +152,12 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Required(CONF_USERNAME): str,
                 vol.Required(CONF_PASSWORD): str,
                 vol.Optional(CONF_COUNTRY, default=DEFAULT_COUNTRY): str,
-                vol.Optional(CONF_CODE, default=DEFAULT_CODE): str,
                 vol.Optional(
                     CONF_CODE_ARM_REQUIRED, default=DEFAULT_CODE_ARM_REQUIRED
                 ): bool,
                 vol.Optional(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
-            }
+            },
+            extra=vol.ALLOW_EXTRA,
         )
     },
     extra=vol.ALLOW_EXTRA,
@@ -214,8 +231,10 @@ def add_device_information[T: dict](config: T) -> T:
 # we *replace* these rather than merge, so a key cleared in options (e.g.
 # CONF_MAP_VACATION) doesn't leave a stale value lingering in entry.data.
 _OPTIONS_MANAGED_FIELDS: tuple[str, ...] = (
-    CONF_CODE,
+    CONF_CODE_HASH,
+    CONF_CODE_IS_NUMERIC,
     CONF_CODE_ARM_REQUIRED,
+    CONF_LOCK_CODE_REQUIRED,
     CONF_SCAN_INTERVAL,
     CONF_MAP_HOME,
     CONF_MAP_AWAY,
@@ -224,28 +243,47 @@ _OPTIONS_MANAGED_FIELDS: tuple[str, ...] = (
     CONF_MAP_VACATION,
     CONF_NOTIFY_GROUP,
     CONF_FORCE_ARM_NOTIFICATIONS,
-    CONF_ENABLE_INTERIOR_PANEL,
-    CONF_ENABLE_PERIMETER_PANEL,
-    CONF_ENABLE_ANNEX_PANEL,
+    *PANEL_OPTION_KEYS,
     CONF_ENABLE_ACTIVITY_POLLING,
     CONF_LOCK_AUTOMATIONS,
     CONF_OPERATION_POLL_TIMEOUT,
 )
 
 
+def _options_are_authoritative(entry: ConfigEntry) -> bool:
+    """Return True once entry.options is the source of truth for its fields.
+
+    Until the options flow runs, it isn't. ``_create_entry_for_installation``
+    seeds entry.options with ``PANEL_OPTION_KEYS`` (the sub-panel toggles)
+    alone, leaving the PIN, mappings, scan interval and everything else in
+    entry.data — so "has the options flow run?" is not the same question as
+    "is entry.options non-empty?", and answering it with the latter is what
+    let ``_synced_entry_data`` delete nine managed keys from a fresh install.
+
+    Seed and test share one constant, and the seed is driven by it
+    (``async_step_options`` moves exactly ``PANEL_OPTION_KEYS`` into options),
+    so the two can't drift apart.
+    """
+    return not set(entry.options).issubset(PANEL_OPTION_KEYS)
+
+
 def _synced_entry_data(entry: ConfigEntry) -> dict[str, Any] | None:
     """Return entry.data with options-managed fields aligned to entry.options.
 
-    Returns ``None`` when no change is needed, or when entry.options is empty
-    (fresh install — initial config-flow values live in entry.data and are
-    the source of truth until the options flow runs at least once).
+    Returns ``None`` when no change is needed, or while entry.options is not
+    yet authoritative (see ``_options_are_authoritative``) — on a fresh
+    install the config-flow values live in entry.data and are the source of
+    truth until the options flow runs at least once.
 
     Otherwise drops options-managed keys from entry.data and re-applies them
     from entry.options, so a key the user cleared in options doesn't keep its
     previous value in data — which `_opt()` (and the options form's
-    `_suggested_map` fallback) would otherwise resurrect.
+    `_suggested_map` fallback) would otherwise resurrect. That replace step
+    relies on clearing being recorded *explicitly*: see
+    ``_normalize_mapping_input``, which turns a cleared mapping into ``""``
+    precisely so its absence can't be mistaken for "never written".
     """
-    if not entry.options:
+    if not _options_are_authoritative(entry):
         return None
     new_data = {k: v for k, v in entry.data.items() if k not in _OPTIONS_MANAGED_FIELDS}
     new_data.update(entry.options)
@@ -263,8 +301,47 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _hash_legacy_plaintext_code(
+    mapping: dict[str, Any], seen: dict[str, tuple[str | None, bool]]
+) -> None:
+    """Replace a legacy plain-text CONF_CODE in *mapping* with its hash.
+
+    Mutates *mapping* in place: drops the raw PIN and writes CONF_CODE_HASH +
+    CONF_CODE_IS_NUMERIC (isdigit()-ness is captured before the value is
+    discarded — it can't be recovered from the hash later).
+
+    Presence is preserved, not just the value: an *empty* CONF_CODE means the
+    user removed the PIN, and in entry.options that emptiness has to keep
+    shadowing a stale entry.data PIN (``_opt`` reads options first, then
+    data). So an empty PIN writes CONF_CODE_HASH=None rather than leaving the
+    key unset, which would stop shadowing and resurrect the old PIN. A
+    mapping with no CONF_CODE at all is left untouched.
+
+    *seen* memoises encodings across the data and options mappings, which
+    usually hold the *same* PIN. Hashing is salted, so encoding each one
+    separately would leave them holding different strings for one PIN —
+    making ``_synced_entry_data`` see a diff that isn't there and costing
+    every upgrading user a spurious entry reload. Genuinely different PINs
+    still get their own encoding.
+    """
+    if CONF_CODE not in mapping:
+        return
+    raw = mapping.pop(CONF_CODE)
+    # Storage is JSON, so a hand-edited entry can hand us an int, a list, or
+    # null. Coerce rather than trust: an int would die in hash_pin's
+    # .encode(), and a list isn't even hashable as a memo key — both raise
+    # out of async_migrate_entry, which fails the whole entry and stops the
+    # integration loading. An unusable PIN the user can clear in the options
+    # dialog is a much better outcome, and coercing keeps the realistic case
+    # (a JSON number that was meant as a PIN) working exactly as intended.
+    plain_code = "" if raw is None else str(raw)
+    if plain_code not in seen:
+        seen[plain_code] = encode_pin(plain_code)
+    mapping[CONF_CODE_HASH], mapping[CONF_CODE_IS_NUMERIC] = seen[plain_code]
+
+
 async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Reject pre-v3 entries; bump v3 → v4 and drop the obsolete CONF_TOKEN."""
+    """Reject pre-v3 entries; bump v3 → v4 → v5 (hash the plain-text PIN)."""
     if config_entry.version < 3:
         _LOGGER.error(
             "Config entry %s uses format v%s which is no longer supported. "
@@ -279,6 +356,19 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
         new_data = dict(config_entry.data)
         new_data.pop(CONF_TOKEN, None)
         hass.config_entries.async_update_entry(config_entry, data=new_data, version=4)
+
+    if config_entry.version == 4:
+        # Both entry.data (fresh installs, or pre-options-flow entries) and
+        # entry.options (once the options flow has run at least once — see
+        # _OPTIONS_MANAGED_FIELDS) may carry a plain-text CONF_CODE.
+        new_data = dict(config_entry.data)
+        new_options = dict(config_entry.options)
+        seen: dict[str, tuple[str | None, bool]] = {}
+        _hash_legacy_plaintext_code(new_data, seen)
+        _hash_legacy_plaintext_code(new_options, seen)
+        hass.config_entries.async_update_entry(
+            config_entry, data=new_data, options=new_options, version=5
+        )
 
     return True
 
@@ -299,9 +389,13 @@ def _build_config_dict(entry: ConfigEntry) -> tuple[dict[str, Any], bool]:
     config[CONF_PASSWORD] = entry.data.get(CONF_PASSWORD, "")
     config[CONF_REFRESH_TOKEN] = entry.data.get(CONF_REFRESH_TOKEN, "")
     config[CONF_COUNTRY] = entry.data.get(CONF_COUNTRY, None)
-    config[CONF_CODE] = _opt(CONF_CODE, DEFAULT_CODE)
+    config[CONF_CODE_HASH] = _opt(CONF_CODE_HASH, None)
+    config[CONF_CODE_IS_NUMERIC] = _opt(CONF_CODE_IS_NUMERIC, False)
     config[CONF_CODE_ARM_REQUIRED] = _opt(
         CONF_CODE_ARM_REQUIRED, DEFAULT_CODE_ARM_REQUIRED
+    )
+    config[CONF_LOCK_CODE_REQUIRED] = _opt(
+        CONF_LOCK_CODE_REQUIRED, DEFAULT_LOCK_CODE_REQUIRED
     )
     config[CONF_SCAN_INTERVAL] = _opt(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
     config[CONF_DELAY_CHECK_OPERATION] = _opt(

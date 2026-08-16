@@ -9,9 +9,9 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import lock
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_CODE
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -21,10 +21,14 @@ from .const import (
     CIRCUIT_ANNEX,
     CIRCUIT_INTERIOR,
     CIRCUIT_PERIMETER,
+    CONF_CODE_HASH,
+    CONF_CODE_IS_NUMERIC,
     CONF_LOCK_AUTOMATIONS,
+    CONF_LOCK_CODE_REQUIRED,
 )
 from .coordinators import LockCoordinator
-from .entity import VerisureEntity
+from .entity import VerisureEntity, lock_device_info
+from .pin_crypto import verify_pin
 from .verisure_owa_api import (
     Installation,
     SmartLock,
@@ -186,22 +190,21 @@ class VerisureLock(  # type: ignore[override]
             f"v4_securitas_direct.{installation.number}_lock_{device_id}"
         )
 
-        # Override device_info: each lock gets its own device, linked to
-        # the installation device via via_device.
-        self._attr_device_info = DeviceInfo(
-            identifiers={
-                (DOMAIN, f"v4_securitas_direct.{installation.number}_lock_{device_id}")
-            },
-            via_device=(DOMAIN, f"v4_securitas_direct.{installation.number}"),
-            name=name,
-            manufacturer="Verisure",
-            model=lock_config.family if lock_config and lock_config.family else None,
-            serial_number=(
-                lock_config.serial_number
-                if lock_config and lock_config.serial_number
-                else None
-            ),
+        # Override device_info: each lock gets its own device, linked to the
+        # installation device (via_device_id on HA >= 2026.8, else via_device).
+        self._attr_device_info = lock_device_info(
+            installation, device_id, name, lock_config, client.hass
         )
+
+        # Reuse the alarm's local PIN to gate lock/unlock/open — opt-in via
+        # CONF_LOCK_CODE_REQUIRED, no effect when no PIN is set. Publishing a
+        # code_format is what makes HA demand (and prompt for) a code, so it
+        # doubles as the "gate is on" flag. Only the PIN's hash is stored, so
+        # digit-ness comes from CONF_CODE_IS_NUMERIC (see pin_crypto).
+        self._code_hash: str | None = client.config.get(CONF_CODE_HASH)
+        if self._code_hash and client.config.get(CONF_LOCK_CODE_REQUIRED, False):
+            is_numeric = client.config.get(CONF_CODE_IS_NUMERIC, False)
+            self._attr_code_format = r"^\d+$" if is_numeric else r".+"
 
         self._operation_in_progress: bool = False
         self._config_retry_unsubs: list[Callable[[], None]] = []
@@ -236,18 +239,12 @@ class VerisureLock(  # type: ignore[override]
         self._lock_config = lock_config
         if lock_config.location:
             self._attr_name = lock_config.location
-        self._attr_device_info = DeviceInfo(
-            identifiers={
-                (
-                    DOMAIN,
-                    f"v4_securitas_direct.{self._installation.number}_lock_{self._device_id}",
-                )
-            },
-            via_device=(DOMAIN, f"v4_securitas_direct.{self._installation.number}"),
-            name=self._attr_name,
-            manufacturer="Verisure",
-            model=lock_config.family or None,
-            serial_number=lock_config.serial_number or None,
+        self._attr_device_info = lock_device_info(
+            self._installation,
+            self._device_id,
+            self._attr_name,
+            lock_config,
+            self._client.hass,
         )
         self.async_write_ha_state()
 
@@ -465,6 +462,28 @@ class VerisureLock(  # type: ignore[override]
 
     # -- Lock/unlock operations ----------------------------------------------
 
+    def _check_code(self, code: str | None) -> None:
+        """Reject the operation unless *code* matches the configured alarm PIN.
+
+        A no-op unless CONF_LOCK_CODE_REQUIRED is enabled and a PIN is
+        configured — ``code_format`` is only published in that case, and its
+        presence is what turns the gate on. Only guards manual service calls
+        (async_lock / async_unlock / async_open) — internal automations like
+        auto-lock-on-arm call ``_change_lock_mode`` directly and never go
+        through here.
+
+        On the real service path this only ever fires for a code that is
+        *well-formed but wrong*: HA's own ``add_default_code`` has already
+        rejected a missing or malformed one against ``code_format`` before
+        ``async_lock`` is reached.
+        """
+        if self.code_format and not verify_pin(code, self._code_hash):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="invalid_pin_code",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
+
     async def _change_lock_mode(
         self,
         lock_state: bool,
@@ -656,6 +675,7 @@ class VerisureLock(  # type: ignore[override]
         raise HomeAssistantError(message)
 
     async def async_lock(self, **kwargs: Any) -> None:
+        self._check_code(kwargs.get(ATTR_CODE))
         error = await self._change_lock_mode(
             lock_state=True,
             transitional_state=LOCK_STATUS_LOCKING,
@@ -734,9 +754,11 @@ class VerisureLock(  # type: ignore[override]
         )
 
     async def async_unlock(self, **kwargs: Any) -> None:
+        self._check_code(kwargs.get(ATTR_CODE))
         await self._perform_user_unlock("Unlock")
 
     async def async_open(self, **kwargs: Any) -> None:
+        self._check_code(kwargs.get(ATTR_CODE))
         await self._perform_user_unlock("Open")
 
     @property

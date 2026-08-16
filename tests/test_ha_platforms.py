@@ -5,15 +5,25 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import device_registry as dr
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.securitas import DOMAIN, _build_config_dict
+from custom_components.securitas import entity as entity_mod
 from custom_components.securitas.api_queue import ApiQueue
+from custom_components.securitas.const import (
+    CONF_CODE_HASH,
+    CONF_CODE_IS_NUMERIC,
+    CONF_LOCK_CODE_REQUIRED,
+)
 from custom_components.securitas.coordinators import (
     ActivityData,
     LockData,
     SentinelData,
 )
 from custom_components.securitas.lock import VerisureLock
+from custom_components.securitas.pin_crypto import encode_pin
 from custom_components.securitas.sensor import (
     ActivityLogSensor,
     SentinelAirQuality,
@@ -37,6 +47,7 @@ from custom_components.securitas.verisure_owa_api.models import (
     SmartLockMode,
     SmartLockModeStatus,
 )
+from tests.conftest import make_config_entry_data
 
 # ---------------------------------------------------------------------------
 # Helper factories
@@ -103,6 +114,10 @@ def make_lock(
     initial_status: str = "2",
     lock_config: SmartLock | None = None,
     poll_status: str | None = None,
+    code: str | None = None,
+    code_required: bool = False,
+    config: dict | None = None,
+    registry_hass=None,
 ):
     """Create a VerisureLock with mocked dependencies.
 
@@ -111,10 +126,29 @@ def make_lock(
             lockStatus for the device.  If *None*, ``get_lock_modes``
             returns an empty list (so ``_get_lock_state`` returns UNKNOWN
             and the optimistic fallback is used).
+        code: Raw alarm PIN, or ``None`` for no PIN. Stored hashed
+            (``CONF_CODE_HASH``/``CONF_CODE_IS_NUMERIC``) to match what
+            ``_build_config_dict`` actually puts on ``client.config`` — the
+            raw PIN is never persisted.
+        code_required: ``CONF_LOCK_CODE_REQUIRED`` toggle.
+        config: Full ``client.config`` override, bypassing ``code``/
+            ``code_required``. Use to drive the entity from a config dict
+            built by production code.
+        registry_hass: Real ``hass`` to expose as ``client.hass`` so
+            device-info construction can resolve ``via_device_id`` from the
+            registry (HA >= 2026.8). Defaults to ``None`` — the deterministic
+            ``via_device`` fallback used by the schema tests.
     """
     installation = make_installation()
+    code_hash, code_is_numeric = encode_pin(code)
     client = MagicMock()
-    client.config = {"scan_interval": 120}
+    client.hass = registry_hass
+    client.config = config or {
+        "scan_interval": 120,
+        CONF_CODE_HASH: code_hash,
+        CONF_CODE_IS_NUMERIC: code_is_numeric,
+        CONF_LOCK_CODE_REQUIRED: code_required,
+    }
     client.session = AsyncMock()
     client.change_lock_mode = AsyncMock()
     if poll_status is not None:
@@ -943,6 +977,47 @@ class TestVerisureLockV5Schema:
         assert (DOMAIN, "v4_securitas_direct.123456_lock_02") in info["identifiers"]
         assert info["via_device"] == (DOMAIN, "v4_securitas_direct.123456")
 
+    async def test_device_info_uses_via_device_id_when_supported(
+        self, hass, monkeypatch
+    ):
+        """On HA >= 2026.8 the lock links to the installation by registry id."""
+        monkeypatch.setattr(entity_mod, "_SUPPORTS_VIA_DEVICE_ID", True)
+        entry = MockConfigEntry(domain=DOMAIN, data={})
+        entry.add_to_hass(hass)
+        parent = dr.async_get(hass).async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, "v4_securitas_direct.123456")},
+            manufacturer="Verisure",
+        )
+        lk = make_lock(device_id="01", registry_hass=hass)
+        # via_device_id isn't a defined DeviceInfo key before HA 2026.8; read
+        # the DeviceInfo as a plain dict so the assertion type-checks on any core.
+        info = dict(lk._attr_device_info or {})
+        assert info["via_device_id"] == parent.id
+        assert "via_device" not in info
+
+    async def test_update_lock_config_uses_via_device_id_when_supported(
+        self, hass, monkeypatch
+    ):
+        """update_lock_config takes the same via_device_id path on new HA."""
+        from custom_components.securitas.verisure_owa_api.models import SmartLock
+
+        monkeypatch.setattr(entity_mod, "_SUPPORTS_VIA_DEVICE_ID", True)
+        entry = MockConfigEntry(domain=DOMAIN, data={})
+        entry.add_to_hass(hass)
+        parent = dr.async_get(hass).async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, "v4_securitas_direct.123456")},
+            manufacturer="Verisure",
+        )
+        lk = make_lock(device_id="02", registry_hass=hass)
+        lk.update_lock_config(
+            SmartLock(location="Front", family="DANALOCK", serial_number="sn")
+        )
+        info = dict(lk._attr_device_info or {})
+        assert info["via_device_id"] == parent.id
+        assert "via_device" not in info
+
 
 class TestVerisureLockActions:
     """Tests for VerisureLock async_lock / async_unlock actions."""
@@ -1203,6 +1278,177 @@ class TestVerisureLockActions:
         # Update was skipped — state unchanged
         assert lock._state == "2"
         lock.async_write_ha_state.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestVerisureLockPinCode:
+    """Tests for the CONF_LOCK_CODE_REQUIRED PIN gate on lock/unlock/open."""
+
+    def test_code_format_unset_by_default(self):
+        """No PIN, no toggle -> code_format stays None (no code prompt)."""
+        lock = make_lock()
+        assert lock.code_format is None
+
+    def test_code_format_unset_when_toggle_off(self):
+        """A PIN is configured but the toggle is off -> no code prompt."""
+        lock = make_lock(code="1234", code_required=False)
+        assert lock.code_format is None
+
+    def test_code_format_unset_when_no_pin_configured(self):
+        """Toggle on but no PIN configured -> no effect, no code prompt."""
+        lock = make_lock(code=None, code_required=True)
+        assert lock.code_format is None
+
+    def test_code_format_numeric_for_digit_pin(self):
+        lock = make_lock(code="1234", code_required=True)
+        assert lock.code_format == r"^\d+$"
+
+    def test_code_format_text_for_alphanumeric_pin(self):
+        lock = make_lock(code="ab12", code_required=True)
+        assert lock.code_format == r".+"
+
+    def test_code_gate_reads_the_keys_build_config_dict_writes(self):
+        """The gate must engage on a config built by production code.
+
+        ``make_lock`` hand-rolls ``client.config``, so a rename of the PIN
+        config keys can silently disable the gate in production while every
+        other test in this class stays green. Drive the entity from a real
+        ``_build_config_dict`` result so the two can't drift apart.
+        """
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data=make_config_entry_data(code="1234"),
+            options={CONF_LOCK_CODE_REQUIRED: True},
+        )
+        config, _ = _build_config_dict(entry)
+
+        lock = make_lock(config=config)
+
+        assert lock.code_format == r"^\d+$"
+        with pytest.raises(ServiceValidationError):
+            lock._check_code("9999")
+        lock._check_code("1234")  # correct PIN — must not raise
+
+    async def test_async_lock_succeeds_with_correct_code(self):
+        lock = make_lock(code="1234", code_required=True, poll_status="2")
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        await lock.async_lock(code="1234")
+
+        assert lock._state == "2"
+
+    async def test_async_lock_raises_with_wrong_code(self):
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError):
+            await lock.async_lock(code="0000")
+
+        lock._client.change_lock_mode.assert_not_awaited()
+
+    async def test_async_lock_raises_with_missing_code(self):
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError):
+            await lock.async_lock()
+
+        lock._client.change_lock_mode.assert_not_awaited()
+
+    async def test_async_unlock_raises_with_wrong_code(self):
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError):
+            await lock.async_unlock(code="wrong")
+
+        lock._client.change_lock_mode.assert_not_awaited()
+
+    async def test_async_open_raises_with_wrong_code(self):
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError):
+            await lock.async_open(code="wrong")
+
+        lock._client.change_lock_mode.assert_not_awaited()
+
+    async def test_async_unlock_succeeds_with_correct_code(self):
+        lock = make_lock(code="1234", code_required=True, poll_status="1")
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        await lock.async_unlock(code="1234")
+
+        assert lock._state == "1"
+
+    async def test_async_open_succeeds_with_correct_code(self):
+        lock = make_lock(code="1234", code_required=True, poll_status="1")
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        await lock.async_open(code="1234")
+
+        assert lock._state == "1"
+
+    async def test_async_unlock_succeeds_without_code_when_not_required(self):
+        """Default behaviour (toggle off) is unaffected — no code needed."""
+        lock = make_lock(poll_status="1")
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        await lock.async_unlock()
+
+        assert lock._state == "1"
+
+    async def test_service_call_without_code_is_rejected_before_dispatch(self):
+        """A `lock.lock` call that omits the PIN never reaches the integration.
+
+        Home Assistant validates the supplied code against ``code_format``
+        in ``add_default_code`` *before* calling ``async_lock``, so the error
+        users see is core's ``add_default_code`` — not our ``invalid_pin_code``.
+        This is what breaks existing automations that don't pass ``code:``.
+        """
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError) as err:
+            await lock.async_handle_lock_service()
+
+        assert err.value.translation_key == "add_default_code"
+        lock._client.change_lock_mode.assert_not_awaited()
+
+    async def test_service_call_with_correct_code_locks(self):
+        """The full service path — core's validation then ours — lets the PIN through."""
+        lock = make_lock(code="1234", code_required=True, poll_status="2")
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        await lock.async_handle_lock_service(code="1234")
+
+        assert lock._state == "2"
+
+    @pytest.mark.parametrize(
+        "service",
+        [
+            "async_handle_lock_service",
+            "async_handle_unlock_service",
+            "async_handle_open_service",
+        ],
+    )
+    async def test_service_call_with_wrong_but_well_formed_code_is_rejected(
+        self, service: str
+    ):
+        """The case that proves the gate isn't just core's regex.
+
+        A numeric ``code_format`` already makes core reject an empty or
+        non-numeric code, so a *well-formed but wrong* PIN is the only thing
+        ``_check_code`` catches on its own — and it must catch it on every
+        gated service, not just lock.
+        """
+        lock = make_lock(code="1234", code_required=True)
+        lock._client.change_lock_mode = AsyncMock(return_value=SmartLockModeStatus())
+
+        with pytest.raises(ServiceValidationError) as err:
+            await getattr(lock, service)(code="9999")
+
+        assert err.value.translation_key == "invalid_pin_code"
+        lock._client.change_lock_mode.assert_not_awaited()
 
 
 class TestVerisureLockCoordinatorUpdate:
